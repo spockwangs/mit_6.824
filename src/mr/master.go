@@ -8,15 +8,20 @@ import "net/http"
 import "time"
 //import "fmt"
 import "sync"
+import "container/list"
 
 type Master struct {
 	// Your definitions here.
 	filenames []string
 	num_reduce int
-	map_tasks map[string]int64
-	pending_map_tasks map[string]int64
-	reduce_tasks map[int]int64
-	pending_reduce_tasks map[int]int64
+	// A list of filenames.
+	mapTasks *list.List
+	// Map filename to start time.
+	pendingMapTasks map[string]int64
+	// A list of reduce indices.
+	reduceTasks *list.List
+	// Map reduce index to start time.
+	pendingReduceTasks map[int]int64
 	mutex sync.Mutex
 	cond *sync.Cond
 }
@@ -47,9 +52,9 @@ func (m *Master) GetTask(task_req *TaskReq, task_resp *TaskResp) error {
 func (m *Master) finishTask(task Task) {
 	switch task.Task_type {
 	case 1:
-		delete(m.pending_map_tasks, task.Map_task.Filename)
+		delete(m.pendingMapTasks, task.Map_task.Filename)
 	case 2:
-		delete(m.pending_reduce_tasks, task.Reduce_task.Reduce_idx)
+		delete(m.pendingReduceTasks, task.Reduce_task.Reduce_idx)
 	}
 	m.cond.Signal()
 }
@@ -63,43 +68,35 @@ const (
 
 func (m *Master) allocateTask() (task Task, status Status) {
 	now := time.Now().Unix()
-	for filename, _ := range m.map_tasks {
+	if m.mapTasks.Len() > 0 {
+		e := m.mapTasks.Front()
 		task.Task_type = 1
 		task.Map_task = MapTask {
-			Filename: filename,
-				Num_reduce: m.num_reduce,
+			Filename: e.Value.(string),
+			Num_reduce: m.num_reduce,
 			}
 		status = OK
-		delete(m.map_tasks, filename)
-		m.pending_map_tasks[filename] = now
+		m.mapTasks.Remove(e)
+		m.pendingMapTasks[e.Value.(string)] = now
 		return
-	}
-	if len(m.pending_map_tasks) > 0 {
+	} else if len(m.pendingMapTasks) > 0 {
 		status = NOT_AVAILABLE
 		return
 	}
 
-	// All map tasks are done. Init reduce tasks.
-	if m.reduce_tasks == nil {
-		m.reduce_tasks = make(map[int]int64)
-		for i := 0; i < m.num_reduce; i++ {
-			m.reduce_tasks[i] = 0
-		}
-	}
-		
-	for idx, _ := range m.reduce_tasks {
+	// All map tasks are done. Allocate reduce tasks.
+	if m.reduceTasks.Len() > 0 {
+		e := m.reduceTasks.Front()
 		task.Task_type = 2
 		task.Reduce_task = ReduceTask {
 			Filenames: m.filenames,
-				Reduce_idx: idx,
+				Reduce_idx: e.Value.(int),
 			}
 		status = OK
-
-		delete(m.reduce_tasks, idx)
-		m.pending_reduce_tasks[idx] = now
+		m.reduceTasks.Remove(e)
+		m.pendingReduceTasks[e.Value.(int)] = now
 		return
-	}
-	if len(m.pending_reduce_tasks) > 0 {
+	} else if len(m.pendingReduceTasks) > 0 {
 		status = NOT_AVAILABLE
 		return
 	}
@@ -109,6 +106,9 @@ func (m *Master) allocateTask() (task Task, status Status) {
 }
 
 func (m *Master) tick() {
+	const (
+		TIMEOUT_SECONDS int64 = 10
+	)
 	for {
 		if m.Done() {
 			return
@@ -118,18 +118,18 @@ func (m *Master) tick() {
 
 		count := 0
 		now := time.Now().Unix()
-		for filename, time := range m.pending_map_tasks {
-			if time + 10 < now {
-				m.map_tasks[filename] = 0
-				delete(m.pending_map_tasks, filename)
+		for filename, time := range m.pendingMapTasks {
+			if time + TIMEOUT_SECONDS < now {
+				m.mapTasks.PushBack(filename)
+				delete(m.pendingMapTasks, filename)
 				count++
 			}
 		}
 
-		for idx, time := range m.pending_reduce_tasks {
-			if time + 10 < now {
-				m.reduce_tasks[idx] = 0
-				delete(m.pending_reduce_tasks, idx)
+		for idx, time := range m.pendingReduceTasks {
+			if time + TIMEOUT_SECONDS < now {
+				m.reduceTasks.PushBack(idx)
+				delete(m.pendingReduceTasks, idx)
 				count++
 			}
 		}
@@ -180,8 +180,8 @@ func (m *Master) Done() bool {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	
-	if len(m.map_tasks) == 0 && len(m.reduce_tasks) == 0 &&
-		len(m.pending_map_tasks) == 0 && len(m.pending_reduce_tasks) == 0 {
+	if m.mapTasks.Len() == 0 && m.reduceTasks.Len() == 0 &&
+		len(m.pendingMapTasks) == 0 && len(m.pendingReduceTasks) == 0 {
 		ret = true
 	}
 
@@ -198,12 +198,16 @@ func MakeMaster(files []string, nReduce int) *Master {
 	// Your code here.
 	m.filenames = files
 	m.num_reduce = nReduce
-	m.map_tasks = make(map[string]int64)
+	m.mapTasks = list.New()
 	for _, filename := range files {
-		m.map_tasks[filename] = 0
+		m.mapTasks.PushBack(filename)
 	}
-	m.pending_map_tasks = make(map[string]int64)
-	m.pending_reduce_tasks = make(map[int]int64)
+	m.pendingMapTasks = make(map[string]int64)
+	m.reduceTasks = list.New()
+	for i := 0; i < m.num_reduce; i++ {
+		m.reduceTasks.PushBack(i)
+	}
+	m.pendingReduceTasks = make(map[int]int64)
 	m.cond = sync.NewCond(&m.mutex)
 	m.server()
 	go m.tick()

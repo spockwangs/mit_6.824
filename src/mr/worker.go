@@ -6,9 +6,7 @@ import "net/rpc"
 import "hash/fnv"
 import "os"
 import "io/ioutil"
-import "bufio"
-import "io"
-import "strings"
+import "encoding/json"
 
 //
 // Map functions return a slice of KeyValue.
@@ -80,20 +78,27 @@ func DoMap(mapf func(string, string) []KeyValue,
 	file.Close()
 	kva := mapf(map_task.Filename, string(content))
 
-	intermediate_files := make([]*os.File, map_task.Num_reduce)
+	type InterFile struct {
+		enc *json.Encoder
+		file *os.File
+	}
+	intermediate_files := make([]InterFile, map_task.Num_reduce)
 	for i := 0; i < map_task.Num_reduce; i++ {
 		ofile, _ := ioutil.TempFile("", "mr-inter-")
-		intermediate_files[i] = ofile
+		intermediate_files[i] = InterFile {
+			enc: json.NewEncoder(ofile),
+				file: ofile,
+			}
 	}
 
 	for _, kv := range kva {
 		idx := ihash(kv.Key) % map_task.Num_reduce
-		ofile := intermediate_files[idx]
-		fmt.Fprintf(ofile, "%s %s\n", kv.Key, kv.Value)
+		enc := intermediate_files[idx].enc
+		enc.Encode(&kv)
 	}
 	for i, file := range intermediate_files {
-		os.Rename(file.Name(), makeIntermediateFilename(map_task.Filename, i))
-		file.Close()
+		os.Rename(file.file.Name(), makeIntermediateFilename(map_task.Filename, i))
+		file.file.Close()
 	}
 }
 	
@@ -106,30 +111,23 @@ func DoReduce(reducef func(string, []string) string,
 		if err != nil {
 			log.Fatalf("cannot open %v", intermediate_filename)
 		}
-		buf := bufio.NewReader(file)
+		dec := json.NewDecoder(file)
 		for {
-			line, err := buf.ReadString('\n')
-			if err == io.EOF {
-				file.Close()
-				break;
-			} else if err != nil {
-				log.Fatalf("cannot read %v", intermediate_filename)
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
 			}
-			line = strings.TrimSpace(line)
-			arr := strings.Split(line, " ")
-			if len(arr) != 2 {
-				log.Fatalf("bad line %v", line)
-			}
-			val, _ := reduce_map[arr[0]]
-			reduce_map[arr[0]] = append(val, arr[1])
+			val, _ := reduce_map[kv.Key]
+			reduce_map[kv.Key] = append(val, kv.Value)
 		}
 	}
 
-	ofile, _ := os.Create(fmt.Sprintf("mr-out-%d", reduce_task.Reduce_idx))
+	ofile, _ := ioutil.TempFile("", "mr-out-")
 	for key, value := range reduce_map {
 		output := reducef(key, value)
 		fmt.Fprintf(ofile, "%v %v\n", key, output)
 	}
+	os.Rename(ofile.Name(), fmt.Sprintf("mr-out-%d", reduce_task.Reduce_idx))
 }
 
 //
