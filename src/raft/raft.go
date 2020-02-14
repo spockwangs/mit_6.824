@@ -25,6 +25,7 @@ import "../labrpc"
 // import "../labgob"
 import "math/rand"
 import "time"
+import "sort"
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -70,6 +71,7 @@ type Raft struct {
 	lastApplied int
 	status int
 	electionExpireTime time.Time
+	applyCh chan ApplyMsg
 	
 	// Volatile state on leaders
 	nextIndex []int		// map peer's index to its next index
@@ -223,13 +225,41 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
+
 	rf.status = FOLLOWER
+	rf.reschedule()
 	if rf.currentTerm < args.Term {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 	}
-	rf.reschedule()
 	reply.Term = rf.currentTerm
+	if len(rf.logs) <= args.PrevLogIndex ||
+		rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		return
+	}
+	i := args.PrevLogIndex + 1;
+	j := 0
+	for ; i < len(rf.logs); i++ {
+		if rf.logs[i].Term != args.Entries[j].Term {
+			break
+		}
+		j++
+	}
+	rf.logs = append(rf.logs[:i], args.Entries[j:]...)
+	if args.LeaderCommit > rf.commitIndex {
+		oldCommitIndex := rf.commitIndex
+		rf.commitIndex = min(args.LeaderCommit, len(rf.logs)-1)
+		DPrintf("me=%v, try to apply [%v, %v]\n",
+			rf.me, oldCommitIndex+1, rf.commitIndex)
+		for i := oldCommitIndex + 1; i <= rf.commitIndex; i++ {
+			rf.applyCh <- ApplyMsg {
+				CommandValid: true,
+					Command: rf.logs[i].Command,
+					CommandIndex: i,
+				}
+		}
+	}
 	reply.Success = true
 	return
 }
@@ -294,7 +324,93 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.status != LEADER {
+		isLeader = false
+		return index, term, isLeader
+	}
 
+	rf.logs = append(rf.logs, LogEntry {
+		Term: rf.currentTerm,
+			Command: command,
+		})
+	index = len(rf.logs) - 1
+	term = rf.currentTerm
+	rf.reschedule()
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+
+		go func(i int) {
+			for {
+				appendEntriesReq := AppendEntriesArgs{}
+				func () {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					if rf.status != LEADER {
+						return
+					}
+					appendEntriesReq.Term = rf.currentTerm
+					appendEntriesReq.LeaderId = rf.me
+					appendEntriesReq.PrevLogIndex = rf.nextIndex[i] - 1
+					appendEntriesReq.PrevLogTerm = rf.logs[rf.nextIndex[i]-1].Term
+					appendEntriesReq.LeaderCommit = rf.commitIndex
+					if len(rf.logs)-1 >= rf.nextIndex[i] {
+						appendEntriesReq.Entries = rf.logs[rf.nextIndex[i]:]
+					}
+				}()
+				
+				appendEntriesResp := AppendEntriesReply{}
+				ok := rf.sendAppendEntries(i, &appendEntriesReq, &appendEntriesResp)
+				DPrintf("me=%v, appendEntriesReq=%v, appendEntriesResp=%v\n",
+					rf.me, appendEntriesReq, appendEntriesResp)
+				if !ok {
+					return
+				}
+
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				if appendEntriesResp.Term > rf.currentTerm {
+					rf.currentTerm = appendEntriesResp.Term
+					rf.status = FOLLOWER
+					rf.votedFor = -1
+					rf.reschedule()
+					return
+				}
+				if appendEntriesResp.Success {
+					rf.nextIndex[i] += len(appendEntriesReq.Entries)
+					rf.matchIndex[i] = rf.nextIndex[i] - 1
+					// Sort matchIndex[] from big to small.
+					sortedMatchIndex := make([]int, len(rf.matchIndex))
+					copy(sortedMatchIndex, rf.matchIndex)
+					sort.Slice(sortedMatchIndex, func(i, j int) bool {
+						return sortedMatchIndex[i] > sortedMatchIndex[j]
+					})
+					majorityMaxIndex := sortedMatchIndex[len(rf.peers)/2]
+					DPrintf("me=%v, majorityMaxIndex=%v\n", rf.me, majorityMaxIndex)
+					if majorityMaxIndex > rf.commitIndex &&
+						rf.logs[majorityMaxIndex].Term == rf.currentTerm {
+						oldCommitIndex := rf.commitIndex
+						rf.commitIndex = majorityMaxIndex
+						DPrintf("me=%v, try to apply [%v, %v]\n",
+							rf.me, oldCommitIndex+1, rf.commitIndex)
+						for i := oldCommitIndex + 1; i <= rf.commitIndex; i++ {
+							rf.applyCh <- ApplyMsg {
+								CommandValid: true,
+									Command: rf.logs[i].Command,
+									CommandIndex: i,
+								}
+						}
+					}
+					return
+				}
+				rf.nextIndex[i]--
+			}
+		} (i)
+	}
+	
 
 	return index, term, isLeader
 }
@@ -352,6 +468,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	for i := range rf.matchIndex {
 		rf.matchIndex[i] = 0
 	}
+	rf.applyCh = applyCh
 	rf.reschedule()
 	
 	// initialize from state persisted before a crash
@@ -448,6 +565,10 @@ func (rf *Raft) startVotes() {
 					if vote_cnt >= (len(rf.peers)/2 + 1) {
 						DPrintf("%v becomes leader\n", rf.me)
 						rf.status = LEADER
+						for i := range rf.nextIndex {
+							rf.nextIndex[i] = len(rf.logs)
+							rf.matchIndex[i] = 0
+						}
 						rf.heartbeat()
 					}
 				}
@@ -500,4 +621,11 @@ func (rf *Raft) heartbeat() {
 			}
 		} (i)
 	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
