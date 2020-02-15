@@ -68,10 +68,11 @@ type Raft struct {
 
 	// Volatile state on all servers.
 	commitIndex int
-	lastApplied int
+	lastApplied int		// Accessed by only one goroutine.
 	status int
 	electionExpireTime time.Time
 	applyCh chan ApplyMsg
+	cond *sync.Cond		// predicate: killed or commitIndex has been advanced
 	
 	// Volatile state on leaders
 	nextIndex []int		// map peer's index to its next index
@@ -261,16 +262,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommit, len(rf.logs)-1)
-		DPrintf("me=%v, try to apply [%v, %v]\n",
-			rf.me, rf.lastApplied+1, rf.commitIndex)
-		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-			rf.applyCh <- ApplyMsg {
-				CommandValid: true,
-					Command: rf.logs[i].Command,
-					CommandIndex: i,
-				}
-			rf.lastApplied = i
+		newCommitIndex := min(args.LeaderCommit, len(rf.logs)-1)
+		if newCommitIndex > rf.commitIndex {
+			rf.commitIndex = newCommitIndex
+			rf.cond.Broadcast()
 		}
 	}
 	reply.Success = true
@@ -278,7 +273,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	DPrintf("me=%v, to=%v, appendEntriesReq=%v\n", rf.me, server, *args)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	DPrintf("me=%v, to=%v, appendEntriesResp=%v\n, ok=%v", rf.me, server, *reply, ok)
 	return ok
 }
 
@@ -312,7 +309,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	DPrintf("me=%v, to=%v, voteReq=%v\n", rf.me, server, *args)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	DPrintf("me=%v, to=%v, voteResp=%v, ok=%v\n", rf.me, server, *reply, ok)
 	return ok
 }
 
@@ -369,6 +368,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.cond.Broadcast()
 }
 
 func (rf *Raft) killed() bool {
@@ -410,12 +410,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.matchIndex[i] = 0
 	}
 	rf.applyCh = applyCh
+	rf.cond = sync.NewCond(&rf.mu)
 	rf.reschedule(false)
 	
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	go rf.tick()
+	go rf.apply()
 	
 	return rf
 }
@@ -485,9 +487,7 @@ func (rf *Raft) startVotes() {
 
 		go func (i int) {
 			voteResp := RequestVoteReply{}
-			DPrintf("me=%v, to=%v, voteReq=%v\n", rf.me, i, voteReq)
 			ok := rf.sendRequestVote(i, &voteReq, &voteResp)
-			DPrintf("me=%v, to=%v, voteResp=%v, ok=%v\n", rf.me, i, voteResp, ok)
 			if !ok {
 				return
 			}
@@ -560,8 +560,6 @@ func (rf *Raft) startCommit() {
 				
 				appendEntriesResp := AppendEntriesReply{}
 				ok := rf.sendAppendEntries(i, &appendEntriesReq, &appendEntriesResp)
-				DPrintf("me=%v, to=%v, appendEntriesReq=%v, appendEntriesResp=%v, ok=%v\n",
-					rf.me, i, appendEntriesReq, appendEntriesResp, ok)
 				if !ok {
 					return
 				}
@@ -597,17 +595,8 @@ func (rf *Raft) startCommit() {
 						DPrintf("me=%v, majorityMaxIndex=%v\n", rf.me, majorityMaxIndex)
 						if majorityMaxIndex > rf.commitIndex &&
 							rf.logs[majorityMaxIndex].Term == rf.currentTerm {
-							oldCommitIndex := rf.commitIndex
 							rf.commitIndex = majorityMaxIndex
-							DPrintf("me=%v, try to apply [%v, %v]\n",
-								rf.me, oldCommitIndex+1, rf.commitIndex)
-							for i := oldCommitIndex + 1; i <= rf.commitIndex; i++ {
-								rf.applyCh <- ApplyMsg {
-									CommandValid: true,
-										Command: rf.logs[i].Command,
-										CommandIndex: i,
-									}
-							}
+							rf.cond.Broadcast()
 						}
 						return true
 					}
@@ -653,4 +642,28 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// Apply commited log entries periodically.
+func (rf *Raft) apply() {
+	for {
+		rf.mu.Lock()
+		for !rf.killed() && rf.lastApplied >= rf.commitIndex {
+			rf.cond.Wait()
+		}
+		if rf.killed() {
+			rf.mu.Unlock()
+			break
+		}
+		entries := append([]LogEntry{}, rf.logs[rf.lastApplied+1:rf.commitIndex+1]...)
+		rf.mu.Unlock()
+		for _, entry := range entries {
+			rf.lastApplied++
+			rf.applyCh <- ApplyMsg {
+				CommandValid: true,
+					Command: entry.Command,
+					CommandIndex: rf.lastApplied,
+			}
+		}
+	}
 }
