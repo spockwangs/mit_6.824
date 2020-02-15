@@ -247,16 +247,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 	if args.LeaderCommit > rf.commitIndex {
-		oldCommitIndex := rf.commitIndex
 		rf.commitIndex = min(args.LeaderCommit, len(rf.logs)-1)
 		DPrintf("me=%v, try to apply [%v, %v]\n",
-			rf.me, oldCommitIndex+1, rf.commitIndex)
-		for i := oldCommitIndex + 1; i <= rf.commitIndex; i++ {
+			rf.me, rf.lastApplied+1, rf.commitIndex)
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			rf.applyCh <- ApplyMsg {
 				CommandValid: true,
 					Command: rf.logs[i].Command,
 					CommandIndex: i,
 				}
+			rf.lastApplied = i
 		}
 	}
 	reply.Success = true
@@ -436,14 +436,15 @@ func (rf *Raft) reschedule(now bool) {
 		return
 	}
 	
-	const kElectionTimeoutMillis int = 200
+	const kHeartbeatIntervalMillis int = 200
+	const kElectionTimeoutMillis int = 2*kHeartbeatIntervalMillis
 	switch rf.status {
 	case FOLLOWER, CANDIDATE:
 		rf.electionExpireTime = time.Now().Add(
-			time.Duration(2*kElectionTimeoutMillis + rand.Intn(100))*time.Millisecond)
+			time.Duration(kElectionTimeoutMillis + rand.Intn(kElectionTimeoutMillis))*time.Millisecond)
 	case LEADER:
 		rf.electionExpireTime = time.Now().Add(
-			time.Duration(kElectionTimeoutMillis) * time.Millisecond)
+			time.Duration(kHeartbeatIntervalMillis) * time.Millisecond)
 	}
 }
 
@@ -521,7 +522,6 @@ func (rf *Raft) startCommit() {
 		go func(i int) {
 			for {
 				appendEntriesReq := AppendEntriesArgs{}
-				nextIndex := rf.nextIndex[i]
 				func () {
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
@@ -557,7 +557,8 @@ func (rf *Raft) startCommit() {
 						return true
 					}
 					if appendEntriesResp.Success {
-						rf.nextIndex[i] = nextIndex + len(appendEntriesReq.Entries)
+						rf.nextIndex[i] = appendEntriesReq.PrevLogIndex +
+							len(appendEntriesReq.Entries) + 1
 						DPrintf("me=%v, nextIndex=%v, len(logs)=%v\n",
 							rf.me, rf.nextIndex, len(rf.logs))
 						rf.matchIndex[i] = rf.nextIndex[i] - 1
