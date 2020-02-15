@@ -191,7 +191,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.LastLogTerm > lastLogTerm ||
 		(args.LastLogTerm == lastLogTerm && args.LastLogIndex + 1 >= len(rf.logs)) {
 		rf.status = FOLLOWER
-		rf.reschedule()
+		rf.reschedule(false)
 		rf.votedFor = args.CandidateId
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
@@ -227,7 +227,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	rf.status = FOLLOWER
-	rf.reschedule()
+	rf.reschedule(false)
 	if rf.currentTerm < args.Term {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
@@ -240,7 +240,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	i := args.PrevLogIndex + 1;
 	j := 0
-	for ; i < len(rf.logs); i++ {
+	for ; i < len(rf.logs) && j < len(args.Entries); i++ {
 		if rf.logs[i].Term != args.Entries[j].Term {
 			break
 		}
@@ -331,86 +331,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	}
 
+	
 	rf.logs = append(rf.logs, LogEntry {
 		Term: rf.currentTerm,
 			Command: command,
 		})
 	index = len(rf.logs) - 1
 	term = rf.currentTerm
-	rf.reschedule()
-	for i, _ := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-
-		go func(i int) {
-			for {
-				appendEntriesReq := AppendEntriesArgs{}
-				func () {
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
-					if rf.status != LEADER {
-						return
-					}
-					appendEntriesReq.Term = rf.currentTerm
-					appendEntriesReq.LeaderId = rf.me
-					appendEntriesReq.PrevLogIndex = rf.nextIndex[i] - 1
-					appendEntriesReq.PrevLogTerm = rf.logs[rf.nextIndex[i]-1].Term
-					appendEntriesReq.LeaderCommit = rf.commitIndex
-					if len(rf.logs)-1 >= rf.nextIndex[i] {
-						appendEntriesReq.Entries = rf.logs[rf.nextIndex[i]:]
-					}
-				}()
-				
-				appendEntriesResp := AppendEntriesReply{}
-				ok := rf.sendAppendEntries(i, &appendEntriesReq, &appendEntriesResp)
-				DPrintf("me=%v, appendEntriesReq=%v, appendEntriesResp=%v\n",
-					rf.me, appendEntriesReq, appendEntriesResp)
-				if !ok {
-					return
-				}
-
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-				if appendEntriesResp.Term > rf.currentTerm {
-					rf.currentTerm = appendEntriesResp.Term
-					rf.status = FOLLOWER
-					rf.votedFor = -1
-					rf.reschedule()
-					return
-				}
-				if appendEntriesResp.Success {
-					rf.nextIndex[i] += len(appendEntriesReq.Entries)
-					rf.matchIndex[i] = rf.nextIndex[i] - 1
-					// Sort matchIndex[] from big to small.
-					sortedMatchIndex := make([]int, len(rf.matchIndex))
-					copy(sortedMatchIndex, rf.matchIndex)
-					sort.Slice(sortedMatchIndex, func(i, j int) bool {
-						return sortedMatchIndex[i] > sortedMatchIndex[j]
-					})
-					majorityMaxIndex := sortedMatchIndex[len(rf.peers)/2]
-					DPrintf("me=%v, majorityMaxIndex=%v\n", rf.me, majorityMaxIndex)
-					if majorityMaxIndex > rf.commitIndex &&
-						rf.logs[majorityMaxIndex].Term == rf.currentTerm {
-						oldCommitIndex := rf.commitIndex
-						rf.commitIndex = majorityMaxIndex
-						DPrintf("me=%v, try to apply [%v, %v]\n",
-							rf.me, oldCommitIndex+1, rf.commitIndex)
-						for i := oldCommitIndex + 1; i <= rf.commitIndex; i++ {
-							rf.applyCh <- ApplyMsg {
-								CommandValid: true,
-									Command: rf.logs[i].Command,
-									CommandIndex: i,
-								}
-						}
-					}
-					return
-				}
-				rf.nextIndex[i]--
-			}
-		} (i)
-	}
-	
+	rf.startCommit()
 
 	return index, term, isLeader
 }
@@ -469,7 +397,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.matchIndex[i] = 0
 	}
 	rf.applyCh = applyCh
-	rf.reschedule()
+	rf.reschedule(false)
 	
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -497,13 +425,18 @@ func (rf *Raft) tick() {
 		case CANDIDATE:
 			rf.startVotes()
 		case LEADER:
-			rf.heartbeat()
+			rf.startCommit()
 		}
 		rf.mu.Unlock()
 	}
 }
 
-func (rf *Raft) reschedule() {
+func (rf *Raft) reschedule(now bool) {
+	if now {
+		rf.electionExpireTime = time.Now()
+		return
+	}
+	
 	const kElectionTimeoutMillis int = 100
 	switch rf.status {
 	case FOLLOWER, CANDIDATE:
@@ -518,7 +451,7 @@ func (rf *Raft) reschedule() {
 func (rf *Raft) startVotes() {
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
-	rf.reschedule()
+	rf.reschedule(false)
 
 	voteReq := RequestVoteArgs{}
 	voteReq.Term = rf.currentTerm
@@ -569,7 +502,7 @@ func (rf *Raft) startVotes() {
 							rf.nextIndex[i] = len(rf.logs)
 							rf.matchIndex[i] = 0
 						}
-						rf.heartbeat()
+						rf.startCommit()
 					}
 				}
 			}()
@@ -577,47 +510,91 @@ func (rf *Raft) startVotes() {
 	}
 }
 
-func (rf *Raft) heartbeat() {
-	rf.reschedule()
+func (rf *Raft) startCommit() {
+	rf.nextIndex[rf.me] = len(rf.logs)
+	rf.matchIndex[rf.me] = rf.nextIndex[rf.me] - 1
+	rf.reschedule(false)
 	for i, _ := range rf.peers {
 		if i == rf.me {
 			continue
 		}
 
-		DPrintf("me=%v, to=%v, heartbeat\n", rf.me, i)
 		go func(i int) {
-			DPrintf("me=%v, to=%v, heartbeat scheduled\n", rf.me, i)
-			appendEntriesReq := AppendEntriesArgs{}
-			func () {
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-				if rf.status != LEADER {
+			for {
+				appendEntriesReq := AppendEntriesArgs{}
+				nextIndex := rf.nextIndex[i]
+				func () {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					if rf.status != LEADER {
+						return
+					}
+					appendEntriesReq.Term = rf.currentTerm
+					appendEntriesReq.LeaderId = rf.me
+					appendEntriesReq.PrevLogIndex = rf.nextIndex[i] - 1
+					appendEntriesReq.PrevLogTerm = rf.logs[rf.nextIndex[i]-1].Term
+					appendEntriesReq.LeaderCommit = rf.commitIndex
+					if len(rf.logs)-1 >= rf.nextIndex[i] {
+						appendEntriesReq.Entries = rf.logs[rf.nextIndex[i]:]
+					}
+				}()
+				
+				appendEntriesResp := AppendEntriesReply{}
+				ok := rf.sendAppendEntries(i, &appendEntriesReq, &appendEntriesResp)
+				DPrintf("me=%v, to=%v, appendEntriesReq=%v, appendEntriesResp=%v, ok=%v\n",
+					rf.me, i, appendEntriesReq, appendEntriesResp, ok)
+				if !ok {
 					return
 				}
-				appendEntriesReq.Term = rf.currentTerm
-				appendEntriesReq.LeaderId = rf.me
-				appendEntriesReq.PrevLogIndex = rf.nextIndex[i] - 1
-				appendEntriesReq.PrevLogTerm = rf.logs[rf.nextIndex[i]-1].Term
-				appendEntriesReq.LeaderCommit = rf.commitIndex
-			}()
-			
-			appendEntriesResp := AppendEntriesReply{}
-			DPrintf("me=%v, to=%v, heartbeatReq=%v\n", rf.me, i, appendEntriesReq)
-			ok := rf.sendAppendEntries(i, &appendEntriesReq, &appendEntriesResp)
-			DPrintf("me=%v, to=%v, heartbeatResp=%v, ok=%v\n",
-				rf.me, i, appendEntriesResp, ok)
-			if !ok {
-				return
-			}
 
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
-			if appendEntriesResp.Term > rf.currentTerm {
-				rf.currentTerm = appendEntriesResp.Term
-				rf.status = FOLLOWER
-				rf.votedFor = -1
-				rf.reschedule()
-				return
+				ok = func () bool {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					if appendEntriesResp.Term > rf.currentTerm {
+						rf.currentTerm = appendEntriesResp.Term
+						rf.status = FOLLOWER
+						rf.votedFor = -1
+						rf.reschedule(false)
+						return true
+					}
+					if appendEntriesResp.Success {
+						rf.nextIndex[i] = nextIndex + len(appendEntriesReq.Entries)
+						DPrintf("me=%v, nextIndex=%v, len(logs)=%v\n",
+							rf.me, rf.nextIndex, len(rf.logs))
+						rf.matchIndex[i] = rf.nextIndex[i] - 1
+						// Sort matchIndex[] from big to small.
+						sortedMatchIndex := make([]int, len(rf.matchIndex))
+						copy(sortedMatchIndex, rf.matchIndex)
+						sort.Slice(sortedMatchIndex, func(i, j int) bool {
+							return sortedMatchIndex[i] > sortedMatchIndex[j]
+						})
+						majorityMaxIndex := sortedMatchIndex[len(rf.peers)/2]
+						DPrintf("me=%v, majorityMaxIndex=%v\n", rf.me, majorityMaxIndex)
+						if majorityMaxIndex > rf.commitIndex &&
+							rf.logs[majorityMaxIndex].Term == rf.currentTerm {
+							oldCommitIndex := rf.commitIndex
+							rf.commitIndex = majorityMaxIndex
+							DPrintf("me=%v, try to apply [%v, %v]\n",
+								rf.me, oldCommitIndex+1, rf.commitIndex)
+							for i := oldCommitIndex + 1; i <= rf.commitIndex; i++ {
+								rf.applyCh <- ApplyMsg {
+									CommandValid: true,
+										Command: rf.logs[i].Command,
+										CommandIndex: i,
+									}
+							}
+							if oldCommitIndex < rf.commitIndex {
+								rf.reschedule(true)
+							}
+						}
+						return true
+					}
+					rf.nextIndex[i]--
+					return false
+				}()
+				if ok {
+					break
+				}
 			}
 		} (i)
 	}
