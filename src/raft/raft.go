@@ -581,11 +581,12 @@ func (rf *Raft) startCommit() {
 						return true
 					}
 					if appendEntriesResp.Success {
-						rf.nextIndex[i] = appendEntriesReq.PrevLogIndex +
-							len(appendEntriesReq.Entries) + 1
+						// Use max() to protect against old resp.
+						rf.matchIndex[i] = max(rf.matchIndex[i],
+							appendEntriesReq.PrevLogIndex + len(appendEntriesReq.Entries))
+						rf.nextIndex[i] = rf.matchIndex[i] + 1
 						DPrintf("me=%v, nextIndex=%v, len(logs)=%v\n",
 							rf.me, rf.nextIndex, len(rf.logs))
-						rf.matchIndex[i] = rf.nextIndex[i] - 1
 						// Sort matchIndex[] from big to small.
 						sortedMatchIndex := make([]int, len(rf.matchIndex))
 						copy(sortedMatchIndex, rf.matchIndex)
@@ -612,6 +613,7 @@ func (rf *Raft) startCommit() {
 					}
 					// AppendEntries fails because of log inconsistency.
 					if appendEntriesReq.Term >= appendEntriesResp.Term {
+						oldNextIndex := rf.nextIndex[i]
 						found := false
 						j := rf.nextIndex[i]-2
 						for ; j > 0; j-- {
@@ -625,6 +627,8 @@ func (rf *Raft) startCommit() {
 						} else {
 							rf.nextIndex[i] = appendEntriesResp.ConflictIndex
 						}
+						DPrintf("me=%v, node=%v, nextIndex from %v to %v\n",
+							rf.me, i, oldNextIndex, rf.nextIndex[i])
 						return false
 					}
 					return true
@@ -639,6 +643,13 @@ func (rf *Raft) startCommit() {
 
 func min(a, b int) int {
 	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
 		return a
 	}
 	return b
