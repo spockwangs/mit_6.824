@@ -275,7 +275,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	DPrintf("me=%v, to=%v, appendEntriesReq=%v\n", rf.me, server, *args)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	DPrintf("me=%v, to=%v, appendEntriesResp=%v\n, ok=%v", rf.me, server, *reply, ok)
+	DPrintf("me=%v, to=%v, appendEntriesResp=%v, ok=%v", rf.me, server, *reply, ok)
 	return ok
 }
 
@@ -350,8 +350,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		})
 	index = len(rf.logs) - 1
 	term = rf.currentTerm
-	rf.startCommit()
-
+	DPrintf("me=%v, start, len(logs)=%v\n", rf.me, len(rf.logs))
+	//rf.startCommit()
+	
 	return index, term, isLeader
 }
 
@@ -452,7 +453,7 @@ func (rf *Raft) reschedule(now bool) {
 		return
 	}
 	
-	const kHeartbeatIntervalMillis int = 200
+	const kHeartbeatIntervalMillis int = 100
 	const kElectionTimeoutMillis int = 2*kHeartbeatIntervalMillis
 	switch rf.status {
 	case FOLLOWER, CANDIDATE:
@@ -462,6 +463,7 @@ func (rf *Raft) reschedule(now bool) {
 		rf.electionExpireTime = time.Now().Add(
 			time.Duration(kHeartbeatIntervalMillis) * time.Millisecond)
 	}
+	DPrintf("me=%v, scheduleTime=%v\n", rf.me, rf.electionExpireTime)
 }
 
 func (rf *Raft) startVotes() {
@@ -518,11 +520,12 @@ func (rf *Raft) startVotes() {
 					if vote_cnt >= (len(rf.peers)/2 + 1) {
 						DPrintf("%v becomes leader\n", rf.me)
 						rf.status = LEADER
-						rf.reschedule(false)
 						for i := range rf.nextIndex {
 							rf.nextIndex[i] = len(rf.logs)
 							rf.matchIndex[i] = 0
 						}
+						// start heartbeat right now
+						rf.reschedule(true)
 					}
 				}
 			}()
@@ -542,11 +545,11 @@ func (rf *Raft) startCommit() {
 		go func(i int) {
 			for {
 				appendEntriesReq := AppendEntriesArgs{}
-				func () {
+				ok := func () bool {
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
 					if rf.status != LEADER {
-						return
+						return false
 					}
 					appendEntriesReq.Term = rf.currentTerm
 					appendEntriesReq.LeaderId = rf.me
@@ -556,10 +559,14 @@ func (rf *Raft) startCommit() {
 					if len(rf.logs)-1 >= rf.nextIndex[i] {
 						appendEntriesReq.Entries = rf.logs[rf.nextIndex[i]:]
 					}
+					return true
 				}()
+				if !ok {
+					return
+				}
 				
 				appendEntriesResp := AppendEntriesReply{}
-				ok := rf.sendAppendEntries(i, &appendEntriesReq, &appendEntriesResp)
+				ok = rf.sendAppendEntries(i, &appendEntriesReq, &appendEntriesResp)
 				if !ok {
 					return
 				}
@@ -591,12 +598,13 @@ func (rf *Raft) startCommit() {
 						sort.Slice(sortedMatchIndex, func(i, j int) bool {
 							return sortedMatchIndex[i] > sortedMatchIndex[j]
 						})
-						majorityMaxIndex := sortedMatchIndex[len(rf.peers)/2]
-						DPrintf("me=%v, majorityMaxIndex=%v\n", rf.me, majorityMaxIndex)
-						if majorityMaxIndex > rf.commitIndex &&
-							rf.logs[majorityMaxIndex].Term == rf.currentTerm {
-							rf.commitIndex = majorityMaxIndex
-							rf.cond.Broadcast()
+						for j := sortedMatchIndex[len(rf.peers)/2]; j > rf.commitIndex; j-- {
+							if rf.logs[j].Term == rf.currentTerm {
+								DPrintf("me=%v, majorityMaxIndex=%v\n", rf.me, j)
+								rf.commitIndex = j
+								rf.cond.Broadcast()
+								break
+							}
 						}
 						return true
 					}
