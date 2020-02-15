@@ -214,6 +214,8 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term int
 	Success bool
+	ConflictTerm int
+	ConflictIndex int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -233,9 +235,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = -1
 	}
 	reply.Term = rf.currentTerm
-	if len(rf.logs) <= args.PrevLogIndex ||
-		rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if len(rf.logs) <= args.PrevLogIndex {
 		reply.Success = false
+		reply.ConflictIndex = len(rf.logs)
+		reply.ConflictTerm = 0
+		return
+	} else if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.ConflictTerm = rf.logs[args.PrevLogIndex].Term
+		// Find the first entry with term equal to ConflictTerm.
+		reply.ConflictIndex = 0
+		for i := args.PrevLogIndex; i > 0; i-- {
+			if rf.logs[i-1].Term != reply.ConflictTerm {
+				reply.ConflictIndex = i
+			}
+		}
 		return
 	}
 
@@ -485,7 +499,13 @@ func (rf *Raft) startVotes() {
 					rf.votedFor = -1
 					rf.status = FOLLOWER
 					return
-				} else if voteResp.Term == rf.currentTerm && rf.status == CANDIDATE {
+				}
+				// Skip old resp.
+				if voteReq.Term != rf.currentTerm {
+					return
+				}
+
+				if rf.status == CANDIDATE {
 					votes_mu.Lock()
 					defer votes_mu.Unlock()
 					votes[i] = voteResp.VoteGranted
@@ -556,6 +576,10 @@ func (rf *Raft) startCommit() {
 						rf.reschedule(false)
 						return true
 					}
+					// Skip old resp.
+					if appendEntriesReq.Term != rf.currentTerm {
+						return true
+					}
 					if appendEntriesResp.Success {
 						rf.nextIndex[i] = appendEntriesReq.PrevLogIndex +
 							len(appendEntriesReq.Entries) + 1
@@ -588,7 +612,19 @@ func (rf *Raft) startCommit() {
 					}
 					// AppendEntries fails because of log inconsistency.
 					if appendEntriesReq.Term >= appendEntriesResp.Term {
-						rf.nextIndex[i]--
+						found := false
+						j := rf.nextIndex[i]-2
+						for ; j > 0; j-- {
+							if rf.logs[j].Term == appendEntriesResp.ConflictTerm {
+								found = true
+								break
+							}
+						}
+						if found {
+							rf.nextIndex[i] = j + 1
+						} else {
+							rf.nextIndex[i] = appendEntriesResp.ConflictIndex
+						}
 						return false
 					}
 					return true
