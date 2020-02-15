@@ -238,15 +238,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-	i := args.PrevLogIndex + 1;
-	j := 0
-	for ; i < len(rf.logs) && j < len(args.Entries); i++ {
-		if rf.logs[i].Term != args.Entries[j].Term {
+
+	// Find the first entry with conflicts.
+	for i, j := args.PrevLogIndex + 1, 0; j < len(args.Entries); i, j = i+1, j+1 {
+		if i >= len(rf.logs) || rf.logs[i].Term != args.Entries[j].Term {
+			rf.logs = append(rf.logs[:i], args.Entries[j:]...)			
 			break
 		}
-		j++
 	}
-	rf.logs = append(rf.logs[:i], args.Entries[j:]...)
 	if args.LeaderCommit > rf.commitIndex {
 		oldCommitIndex := rf.commitIndex
 		rf.commitIndex = min(args.LeaderCommit, len(rf.logs)-1)
@@ -437,11 +436,11 @@ func (rf *Raft) reschedule(now bool) {
 		return
 	}
 	
-	const kElectionTimeoutMillis int = 100
+	const kElectionTimeoutMillis int = 200
 	switch rf.status {
 	case FOLLOWER, CANDIDATE:
 		rf.electionExpireTime = time.Now().Add(
-			time.Duration(kElectionTimeoutMillis + 100 + rand.Intn(100))*time.Millisecond)
+			time.Duration(2*kElectionTimeoutMillis + rand.Intn(100))*time.Millisecond)
 	case LEADER:
 		rf.electionExpireTime = time.Now().Add(
 			time.Duration(kElectionTimeoutMillis) * time.Millisecond)
@@ -498,11 +497,11 @@ func (rf *Raft) startVotes() {
 					if vote_cnt >= (len(rf.peers)/2 + 1) {
 						DPrintf("%v becomes leader\n", rf.me)
 						rf.status = LEADER
+						rf.reschedule(false)
 						for i := range rf.nextIndex {
 							rf.nextIndex[i] = len(rf.logs)
 							rf.matchIndex[i] = 0
 						}
-						rf.startCommit()
 					}
 				}
 			}()
@@ -583,14 +582,15 @@ func (rf *Raft) startCommit() {
 										CommandIndex: i,
 									}
 							}
-							if oldCommitIndex < rf.commitIndex {
-								rf.reschedule(true)
-							}
 						}
 						return true
 					}
-					rf.nextIndex[i]--
-					return false
+					// AppendEntries fails because of log inconsistency.
+					if appendEntriesReq.Term >= appendEntriesResp.Term {
+						rf.nextIndex[i]--
+						return false
+					}
+					return true
 				}()
 				if ok {
 					break
