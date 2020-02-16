@@ -484,7 +484,7 @@ func (rf *Raft) reschedule(now bool) {
 		return
 	}
 	
-	const kHeartbeatIntervalMillis int = 50
+	const kHeartbeatIntervalMillis int = 100
 	const kElectionTimeoutMillis int = 2*kHeartbeatIntervalMillis
 	switch rf.status {
 	case FOLLOWER, CANDIDATE:
