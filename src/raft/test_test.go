@@ -14,7 +14,6 @@ import "time"
 import "math/rand"
 import "sync/atomic"
 import "sync"
-import "log"
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -378,8 +377,6 @@ func TestBackup2B(t *testing.T) {
 
 	cfg.one(rand.Int(), servers, true)
 
-	log.Printf("step1\n")
-
 	// put leader and one follower in a partition
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect((leader1 + 2) % servers)
@@ -391,12 +388,8 @@ func TestBackup2B(t *testing.T) {
 		cfg.rafts[leader1].Start(rand.Int())
 	}
 
-	log.Printf("step2\n")
-
 	time.Sleep(RaftElectionTimeout / 2)
 
-	log.Printf("step3\n")
-	
 	cfg.disconnect((leader1 + 0) % servers)
 	cfg.disconnect((leader1 + 1) % servers)
 
@@ -410,8 +403,6 @@ func TestBackup2B(t *testing.T) {
 		cfg.one(rand.Int(), 3, true)
 	}
 
-	log.Printf("step4\n")
-	
 	// now another partitioned leader and one follower
 	leader2 := cfg.checkOneLeader()
 	other := (leader1 + 2) % servers
@@ -425,12 +416,8 @@ func TestBackup2B(t *testing.T) {
 		cfg.rafts[leader2].Start(rand.Int())
 	}
 
-	log.Printf("step5\n")
-
 	time.Sleep(RaftElectionTimeout / 2)
 
-	log.Printf("step6\n")
-		
 	// bring original leader back to life,
 	for i := 0; i < servers; i++ {
 		cfg.disconnect(i)
@@ -439,20 +426,16 @@ func TestBackup2B(t *testing.T) {
 	cfg.connect((leader1 + 1) % servers)
 	cfg.connect(other)
 
-	log.Printf("step7\n")
-	
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
 	}
 
-	log.Printf("step8\n")
-	
 	// now everyone
 	for i := 0; i < servers; i++ {
 		cfg.connect(i)
 	}
-	log.Printf("step9\n")
+
 	cfg.one(rand.Int(), servers, true)
 
 	cfg.end()

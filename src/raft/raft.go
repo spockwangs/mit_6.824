@@ -380,8 +380,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		})
 	index = len(rf.logs) - 1
 	term = rf.currentTerm
-	//DPrintf("me=%v, start, len(logs)=%v\n", rf.me, len(rf.logs))
-	//rf.startCommit()
+
+	// Start commit immediately can shorten the commit latency but use RPC bandwidth less
+	// efficiently.
+	// rf.startCommit()
 	
 	return index, term, isLeader
 }
@@ -463,7 +465,6 @@ func (rf *Raft) tick() {
 			continue
 		}
 		
-		//DPrintf("me=%v, status=%v\n", rf.me, rf.status)
 		switch rf.status {
 		case FOLLOWER:
 			rf.status = CANDIDATE
@@ -471,7 +472,6 @@ func (rf *Raft) tick() {
 		case CANDIDATE:
 			rf.startVotes()
 		case LEADER:
-			DPrintf("me=%v%v, startCommit\n", rf.me, rf.toString())
 			rf.startCommit()
 		}
 		rf.mu.Unlock()
@@ -484,7 +484,7 @@ func (rf *Raft) reschedule(now bool) {
 		return
 	}
 	
-	const kHeartbeatIntervalMillis int = 100
+	const kHeartbeatIntervalMillis int = 200
 	const kElectionTimeoutMillis int = 2*kHeartbeatIntervalMillis
 	switch rf.status {
 	case FOLLOWER, CANDIDATE:
@@ -523,42 +523,42 @@ func (rf *Raft) startVotes() {
 			if !ok {
 				return
 			}
-			func () {
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-				if voteResp.Term > rf.currentTerm {
-					rf.currentTerm = voteResp.Term
-					rf.votedFor = -1
-					rf.status = FOLLOWER
-					return
-				}
-				// Skip old resp.
-				if voteReq.Term != rf.currentTerm {
-					return
-				}
 
-				if rf.status == CANDIDATE {
-					votes_mu.Lock()
-					defer votes_mu.Unlock()
-					votes[i] = voteResp.VoteGranted
-					vote_cnt := 0
-					for _, vote := range votes {
-						if vote {
-							vote_cnt++
-						}
-					}
-					if vote_cnt >= (len(rf.peers)/2 + 1) {
-						DPrintf("%v becomes leader\n", rf.me)
-						rf.status = LEADER
-						for i := range rf.nextIndex {
-							rf.nextIndex[i] = len(rf.logs)
-							rf.matchIndex[i] = 0
-						}
-						// start heartbeat right now
-						rf.reschedule(true)
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if voteResp.Term > rf.currentTerm {
+				rf.currentTerm = voteResp.Term
+				rf.votedFor = -1
+				rf.status = FOLLOWER
+				return
+			}
+			// Skip old resp.
+			if voteReq.Term != rf.currentTerm {
+				return
+			}
+
+			if rf.status == CANDIDATE {
+				votes_mu.Lock()
+				votes[i] = voteResp.VoteGranted
+				vote_cnt := 0
+				for _, vote := range votes {
+					if vote {
+						vote_cnt++
 					}
 				}
-			}()
+				votes_mu.Unlock()
+				if vote_cnt >= (len(rf.peers)/2 + 1) {
+					DPrintf("%v becomes leader\n", rf.me)
+					rf.status = LEADER
+					for i := range rf.nextIndex {
+						rf.nextIndex[i] = len(rf.logs)
+						rf.matchIndex[i] = 0
+					}
+					// start heartbeat right now to prevent some
+					// follower from becoming a candidate.
+					rf.reschedule(true)
+				}
+			}
 		} (i)
 	}
 }
@@ -630,9 +630,13 @@ func (rf *Raft) startCommit() {
 						})
 						for j := sortedMatchIndex[len(rf.peers)/2]; j > rf.commitIndex; j-- {
 							if rf.logs[j].Term == rf.currentTerm {
-								//DPrintf("me=%v, majorityMaxIndex=%v\n", rf.me, j)
 								rf.commitIndex = j
 								rf.cond.Broadcast()
+								// Start heartbeat right now to tell
+								// followers the new commit index
+								// immediately and speed up the
+								// commit process.
+								rf.reschedule(true)
 								break
 							}
 						}
@@ -654,8 +658,6 @@ func (rf *Raft) startCommit() {
 						} else {
 							rf.nextIndex[i] = appendEntriesResp.ConflictIndex
 						}
-						//DPrintf("me=%v, node=%v, nextIndex from %v to %v\n",
-						//rf.me, i, oldNextIndex, rf.nextIndex[i])
 						return false
 					}
 					return true
