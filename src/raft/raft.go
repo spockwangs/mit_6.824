@@ -26,6 +26,7 @@ import "../labrpc"
 import "math/rand"
 import "time"
 import "sort"
+import "fmt"
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -152,6 +153,11 @@ type RequestVoteArgs struct {
 	LastLogTerm int
 }
 
+func (voteReq *RequestVoteArgs) toString() string {
+	return fmt.Sprintf("(Term=%v, CandidateId=%v, LastLogIndex=%v, LastLogTerm=%v)",
+		voteReq.Term, voteReq.CandidateId, voteReq.LastLogIndex, voteReq.LastLogTerm)
+}
+
 //
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
@@ -162,6 +168,10 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+func (voteResp *RequestVoteReply) toString() string {
+	return fmt.Sprintf("(Term=%v, VoteGranted=%v)", voteResp.Term, voteResp.VoteGranted)
+}
+	
 //
 // example RequestVote RPC handler.
 //
@@ -212,11 +222,21 @@ type AppendEntriesArgs struct {
 	LeaderCommit int
 }
 
+func (this *AppendEntriesArgs) toString() string {
+	return fmt.Sprintf("(Term=%v, LeaderId=%v, PrevLogIndex=%v, PrevLogTerm=%v, #Entries=%v, LeaderCommit=%v)",
+		this.Term, this.LeaderId, this.PrevLogIndex, this.PrevLogTerm, len(this.Entries), this.LeaderCommit)
+}
+
 type AppendEntriesReply struct {
 	Term int
 	Success bool
 	ConflictTerm int
 	ConflictIndex int
+}
+
+func (this *AppendEntriesReply) toString() string {
+	return fmt.Sprintf("(Term=%v, Success=%v, ConflictTerm=%v, ConflictIndex=%v)",
+		this.Term, this.Success, this.ConflictTerm, this.ConflictIndex)
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -273,9 +293,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	DPrintf("me=%v, to=%v, appendEntriesReq=%v\n", rf.me, server, *args)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	DPrintf("me=%v, to=%v, appendEntriesResp=%v, ok=%v", rf.me, server, *reply, ok)
+	if rf.killed() {
+		return false
+	}
+	rf.mu.Lock()
+	DPrintf("me=%v%v, to=%v, appendEntriesReq=%v, appendEntriesResp=%v, ok=%v",
+		rf.me, rf.toString(), server, args.toString(), reply.toString(), ok)
+	rf.mu.Unlock()
 	return ok
 }
 
@@ -309,9 +334,14 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	DPrintf("me=%v, to=%v, voteReq=%v\n", rf.me, server, *args)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	DPrintf("me=%v, to=%v, voteResp=%v, ok=%v\n", rf.me, server, *reply, ok)
+	if rf.killed() {
+		return false
+	}
+	rf.mu.Lock()
+	DPrintf("me=%v%v, to=%v, voteReq=%v, voteResp=%v, ok=%v\n",
+		rf.me, rf.toString(), server, args.toString(), reply.toString(), ok)
+	rf.mu.Unlock()
 	return ok
 }
 
@@ -350,7 +380,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		})
 	index = len(rf.logs) - 1
 	term = rf.currentTerm
-	DPrintf("me=%v, start, len(logs)=%v\n", rf.me, len(rf.logs))
+	//DPrintf("me=%v, start, len(logs)=%v\n", rf.me, len(rf.logs))
 	//rf.startCommit()
 	
 	return index, term, isLeader
@@ -433,7 +463,7 @@ func (rf *Raft) tick() {
 			continue
 		}
 		
-		DPrintf("me=%v, status=%v\n", rf.me, rf.status)
+		//DPrintf("me=%v, status=%v\n", rf.me, rf.status)
 		switch rf.status {
 		case FOLLOWER:
 			rf.status = CANDIDATE
@@ -441,6 +471,7 @@ func (rf *Raft) tick() {
 		case CANDIDATE:
 			rf.startVotes()
 		case LEADER:
+			DPrintf("me=%v%v, startCommit\n", rf.me, rf.toString())
 			rf.startCommit()
 		}
 		rf.mu.Unlock()
@@ -453,7 +484,7 @@ func (rf *Raft) reschedule(now bool) {
 		return
 	}
 	
-	const kHeartbeatIntervalMillis int = 100
+	const kHeartbeatIntervalMillis int = 50
 	const kElectionTimeoutMillis int = 2*kHeartbeatIntervalMillis
 	switch rf.status {
 	case FOLLOWER, CANDIDATE:
@@ -463,7 +494,6 @@ func (rf *Raft) reschedule(now bool) {
 		rf.electionExpireTime = time.Now().Add(
 			time.Duration(kHeartbeatIntervalMillis) * time.Millisecond)
 	}
-	DPrintf("me=%v, scheduleTime=%v\n", rf.me, rf.electionExpireTime)
 }
 
 func (rf *Raft) startVotes() {
@@ -590,8 +620,8 @@ func (rf *Raft) startCommit() {
 						rf.matchIndex[i] = max(rf.matchIndex[i],
 							appendEntriesReq.PrevLogIndex + len(appendEntriesReq.Entries))
 						rf.nextIndex[i] = rf.matchIndex[i] + 1
-						DPrintf("me=%v, nextIndex=%v, len(logs)=%v\n",
-							rf.me, rf.nextIndex, len(rf.logs))
+						DPrintf("me=%v, matchIndex=%v, len(logs)=%v\n",
+							rf.me, rf.matchIndex, len(rf.logs))
 						// Sort matchIndex[] from big to small.
 						sortedMatchIndex := make([]int, len(rf.matchIndex))
 						copy(sortedMatchIndex, rf.matchIndex)
@@ -600,7 +630,7 @@ func (rf *Raft) startCommit() {
 						})
 						for j := sortedMatchIndex[len(rf.peers)/2]; j > rf.commitIndex; j-- {
 							if rf.logs[j].Term == rf.currentTerm {
-								DPrintf("me=%v, majorityMaxIndex=%v\n", rf.me, j)
+								//DPrintf("me=%v, majorityMaxIndex=%v\n", rf.me, j)
 								rf.commitIndex = j
 								rf.cond.Broadcast()
 								break
@@ -610,7 +640,7 @@ func (rf *Raft) startCommit() {
 					}
 					// AppendEntries fails because of log inconsistency.
 					if appendEntriesReq.Term >= appendEntriesResp.Term {
-						oldNextIndex := rf.nextIndex[i]
+						// oldNextIndex := rf.nextIndex[i]
 						found := false
 						j := rf.nextIndex[i]-2
 						for ; j > 0; j-- {
@@ -624,8 +654,8 @@ func (rf *Raft) startCommit() {
 						} else {
 							rf.nextIndex[i] = appendEntriesResp.ConflictIndex
 						}
-						DPrintf("me=%v, node=%v, nextIndex from %v to %v\n",
-							rf.me, i, oldNextIndex, rf.nextIndex[i])
+						//DPrintf("me=%v, node=%v, nextIndex from %v to %v\n",
+						//rf.me, i, oldNextIndex, rf.nextIndex[i])
 						return false
 					}
 					return true
@@ -675,3 +705,18 @@ func (rf *Raft) apply() {
 		}
 	}
 }
+
+func (rf *Raft) toString() string {
+	var s string
+	switch rf.status {
+	case FOLLOWER:
+		s = "FOLLOWER"
+	case CANDIDATE:
+		s = "CANDIDATE"
+	case LEADER:
+		s = "LEADER"
+	}
+	return fmt.Sprintf("(term=%v, status=%v, commitIdx=%v)", rf.currentTerm, s, rf.commitIndex)
+}
+
+
