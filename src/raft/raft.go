@@ -21,8 +21,8 @@ import "sync"
 import "sync/atomic"
 import "../labrpc"
 
-// import "bytes"
-// import "../labgob"
+import "bytes"
+import "../labgob"
 import "math/rand"
 import "time"
 import "sort"
@@ -107,12 +107,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 
@@ -125,21 +126,21 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term int
+	var votedFor int
+	var logs []LogEntry
+	if d.Decode(&term) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil {
+		panic(fmt.Sprintf("decode failed"))
+	} else {
+		rf.currentTerm = term
+		rf.votedFor = votedFor
+		rf.logs = logs
+	}
 }
-
-
-
 
 //
 // example RequestVote RPC arguments structure.
@@ -179,7 +180,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
+	changed := false
+	defer func() {
+		if changed {
+			rf.persist()
+		}
+	}()
+	
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
@@ -190,6 +197,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.status = FOLLOWER
 		rf.votedFor = -1
+		changed = true
 	}
 	
 	if rf.votedFor >= 0 && rf.votedFor != args.CandidateId {
@@ -204,6 +212,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.status = FOLLOWER
 		rf.reschedule(false)
 		rf.votedFor = args.CandidateId
+		changed = true
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
 		return
@@ -242,7 +251,13 @@ func (this *AppendEntriesReply) toString() string {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
+	changed := false	// Is persistent state changed?
+	defer func() {
+		if changed {
+			rf.persist()
+		}
+	}()
+	
 	if rf.currentTerm > args.Term {
 		reply.Term = rf.currentTerm
 		reply.Success = false
@@ -254,6 +269,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.currentTerm < args.Term {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		changed = true
 	}
 	reply.Term = rf.currentTerm
 	if len(rf.logs) <= args.PrevLogIndex {
@@ -278,6 +294,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	for i, j := args.PrevLogIndex + 1, 0; j < len(args.Entries); i, j = i+1, j+1 {
 		if i >= len(rf.logs) || rf.logs[i].Term != args.Entries[j].Term {
 			rf.logs = append(rf.logs[:i], args.Entries[j:]...)			
+			changed = true
 			break
 		}
 	}
@@ -368,16 +385,23 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	changed := false
+	defer func() {
+		if changed {
+			rf.persist()
+		}
+	}()
+	
 	if rf.status != LEADER {
 		isLeader = false
 		return index, term, isLeader
 	}
 
-	
 	rf.logs = append(rf.logs, LogEntry {
 		Term: rf.currentTerm,
 			Command: command,
 		})
+	changed = true
 	index = len(rf.logs) - 1
 	term = rf.currentTerm
 
@@ -457,6 +481,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func (rf *Raft) tick() {
 	for !rf.killed() {
+		changed := false
 		rf.mu.Lock()
 		now := time.Now()
 		if rf.electionExpireTime.After(now) {
@@ -471,8 +496,12 @@ func (rf *Raft) tick() {
 			fallthrough
 		case CANDIDATE:
 			rf.startVotes()
+			changed = true
 		case LEADER:
 			rf.startCommit()
+		}
+		if changed {
+			rf.persist()
 		}
 		rf.mu.Unlock()
 	}
@@ -496,6 +525,7 @@ func (rf *Raft) reschedule(now bool) {
 	}
 }
 
+// Start to send vote requests to peers.
 func (rf *Raft) startVotes() {
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
@@ -526,10 +556,18 @@ func (rf *Raft) startVotes() {
 
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
+			changed := false
+			defer func() {
+				if changed {
+					rf.persist()
+				}
+			}()
+			
 			if voteResp.Term > rf.currentTerm {
 				rf.currentTerm = voteResp.Term
 				rf.votedFor = -1
 				rf.status = FOLLOWER
+				changed = true
 				return
 			}
 			// Skip old resp.
@@ -563,6 +601,7 @@ func (rf *Raft) startVotes() {
 	}
 }
 
+// Start to send entries (or heartbeats if entries are empty)  to followers.
 func (rf *Raft) startCommit() {
 	rf.nextIndex[rf.me] = len(rf.logs)
 	rf.matchIndex[rf.me] = rf.nextIndex[rf.me] - 1
@@ -604,11 +643,19 @@ func (rf *Raft) startCommit() {
 				ok = func () bool {
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
+					changed := false
+					defer func() {
+						if changed {
+							rf.persist()
+						}
+					}()
+					
 					if appendEntriesResp.Term > rf.currentTerm {
 						rf.currentTerm = appendEntriesResp.Term
 						rf.status = FOLLOWER
 						rf.votedFor = -1
 						rf.reschedule(false)
+						changed = true
 						return true
 					}
 					// Skip old resp.
@@ -720,5 +767,3 @@ func (rf *Raft) toString() string {
 	}
 	return fmt.Sprintf("(term=%v, status=%v, commitIdx=%v)", rf.currentTerm, s, rf.commitIndex)
 }
-
-
