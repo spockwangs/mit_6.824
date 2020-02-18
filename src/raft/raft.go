@@ -43,6 +43,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	Term int
 }
 
 //
@@ -73,11 +74,11 @@ type Raft struct {
 	status int
 	electionExpireTime time.Time
 	applyCh chan ApplyMsg
-	cond *sync.Cond		// predicate: killed or commitIndex has been advanced
 	
 	// Volatile state on leaders
 	nextIndex []int		// map peer's index to its next index
 	matchIndex []int 	// map peer's index to its highest replicated log entry
+	stateChanged *sync.Cond	// predicate: killed or term changed or logs appended
 }
 type LogEntry struct {
 	Command interface{}
@@ -184,6 +185,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer func() {
 		if changed {
 			rf.persist()
+			rf.stateChanged.Broadcast()
 		}
 	}()
 	
@@ -255,6 +257,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer func() {
 		if changed {
 			rf.persist()
+			rf.stateChanged.Broadcast()
 		}
 	}()
 	
@@ -302,7 +305,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		newCommitIndex := min(args.LeaderCommit, len(rf.logs)-1)
 		if newCommitIndex > rf.commitIndex {
 			rf.commitIndex = newCommitIndex
-			rf.cond.Broadcast()
+			rf.stateChanged.Broadcast()
 		}
 	}
 	reply.Success = true
@@ -425,7 +428,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	rf.cond.Broadcast()
+	rf.stateChanged.Broadcast()
 }
 
 func (rf *Raft) killed() bool {
@@ -467,7 +470,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.matchIndex[i] = 0
 	}
 	rf.applyCh = applyCh
-	rf.cond = sync.NewCond(&rf.mu)
+	rf.stateChanged = sync.NewCond(&rf.mu)
 	rf.reschedule(false)
 	
 	// initialize from state persisted before a crash
@@ -678,7 +681,7 @@ func (rf *Raft) startCommit() {
 						for j := sortedMatchIndex[len(rf.peers)/2]; j > rf.commitIndex; j-- {
 							if rf.logs[j].Term == rf.currentTerm {
 								rf.commitIndex = j
-								rf.cond.Broadcast()
+								rf.stateChanged.Broadcast()
 								// Start heartbeat right now to tell
 								// followers the new commit index
 								// immediately and speed up the
@@ -734,22 +737,24 @@ func max(a, b int) int {
 // Apply commited log entries periodically.
 func (rf *Raft) apply() {
 	for {
-		rf.mu.Lock()
-		for !rf.killed() && rf.lastApplied >= rf.commitIndex {
-			rf.cond.Wait()
-		}
-		if rf.killed() {
-			rf.mu.Unlock()
-			break
-		}
-		entries := append([]LogEntry{}, rf.logs[rf.lastApplied+1:rf.commitIndex+1]...)
-		rf.mu.Unlock()
-		for _, entry := range entries {
-			rf.lastApplied++
-			rf.applyCh <- ApplyMsg {
-				CommandValid: true,
-					Command: entry.Command,
-					CommandIndex: rf.lastApplied,
+		var entries []LogEntry
+		func() {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if rf.lastApplied < rf.commitIndex {
+				entries = append([]LogEntry{}, rf.logs[rf.lastApplied+1:rf.commitIndex+1]...)
+				return
+			}
+			rf.stateChanged.Wait()
+		}()
+		if entries != nil {
+			for _, entry := range entries {
+				rf.lastApplied++
+				rf.applyCh <- ApplyMsg {
+					CommandValid: true,
+						Command: entry.Command,
+						CommandIndex: rf.lastApplied,
+					}
 			}
 		}
 	}
