@@ -7,6 +7,7 @@ import (
 	"../raft"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = 0
@@ -23,8 +24,16 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Op string		// "Put" or "Append"
+	Key string
+	Value string
+	Seq int64
 }
 
+type DbValue struct {
+	value string
+	seq int64
+}
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -35,15 +44,57 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	db map[string]DbValue
+	lastApplied int
+	term int
+	cond *sync.Cond		// predicate: term changed or lastApplied changed
 }
 
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	value, ok := kv.db[args.Key]
+	if ok {
+		reply.Value = value.value
+		reply.Err = OK
+	} else {
+		reply.Value = ""
+		reply.Err = ErrNoKey
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	index, term, isLeader := kv.rf.Start(Op{
+		Op: args.Op,
+		Key: args.Key,
+		Value: args.Value,
+		Seq: args.Seq,
+	})
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	
+	for kv.term <= term {
+		if kv.lastApplied >= index {
+			reply.Err = OK
+			return
+		}
+		kv.cond.Wait()
+	}
+	reply.Err = ErrWrongLeader
+	return 
 }
 
 //
@@ -91,11 +142,67 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
+	kv.db = make(map[string]DbValue)
+	kv.cond = sync.NewCond(&kv.mu)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-
+	go kv.apply()
+	
 	return kv
+}
+
+func (kv *KVServer) apply() {
+	for {
+		select {
+		case m, ok := <- kv.applyCh:
+			if !ok {
+				return
+			}
+			if !m.CommandValid {
+				continue
+			}
+
+			op := m.Command.(Op)
+			DPrintf("received op: %v\n", op)
+			kv.mu.Lock()
+			switch op.Op {
+			case "Put":
+				kv.db[op.Key] = DbValue{
+					value: op.Value,
+					seq: op.Seq,
+				}
+			case "Append":
+				oldValue, ok := kv.db[op.Key]
+				if ok {
+					// Detect duplicate reqs.
+					if oldValue.seq != op.Seq {
+						kv.db[op.Key] = DbValue{
+							value: oldValue.value + op.Value,
+							seq: op.Seq,
+						}
+					}
+				} else {
+					kv.db[op.Key] = DbValue{
+						value: op.Value,
+						seq: op.Seq,
+					}
+				}
+			}
+			kv.lastApplied = m.CommandIndex
+			kv.cond.Broadcast()
+			kv.mu.Unlock()
+		default:
+			term, _ := kv.rf.GetState()
+			kv.mu.Lock()
+			if term > kv.term {
+				kv.term = term
+				kv.cond.Broadcast()
+			}
+			kv.mu.Unlock()
+			time.Sleep(5*time.Millisecond)
+		}
+	}
 }
