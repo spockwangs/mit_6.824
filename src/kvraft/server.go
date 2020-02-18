@@ -24,15 +24,15 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Op string		// "Put" or "Append"
+	Op string		// "Put" or "Append" or "Noop"
 	Key string
 	Value string
+	ClientId int64
 	Seq int64
 }
 
 type DbValue struct {
 	value string
-	seq int64
 }
 type KVServer struct {
 	mu      sync.Mutex
@@ -45,6 +45,7 @@ type KVServer struct {
 
 	// Your definitions here.
 	db map[string]DbValue
+	clientSeq map[int64]int64 // client id => last op seq
 	lastApplied int
 	term int
 	cond *sync.Cond		// predicate: term changed or lastApplied changed
@@ -53,7 +54,9 @@ type KVServer struct {
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	_, isLeader := kv.rf.GetState()
+	index, term, isLeader := kv.rf.Start(Op{
+		Op: "Noop",
+	})
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
@@ -61,31 +64,40 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	value, ok := kv.db[args.Key]
-	if ok {
-		reply.Value = value.value
-		reply.Err = OK
-	} else {
-		reply.Value = ""
-		reply.Err = ErrNoKey
+	for kv.term <= term {
+		if kv.lastApplied >= index {
+			value, ok := kv.db[args.Key]
+			if ok {
+				reply.Value = value.value
+				reply.Err = OK
+			} else {
+				reply.Value = ""
+				reply.Err = ErrNoKey
+			}
+			return
+		}
+		kv.cond.Wait()
 	}
+	reply.Err = ErrWrongLeader
+	return 
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
 	index, term, isLeader := kv.rf.Start(Op{
 		Op: args.Op,
 		Key: args.Key,
 		Value: args.Value,
 		Seq: args.Seq,
+		ClientId: args.ClientId,
 	})
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
 	
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 	for kv.term <= term {
 		if kv.lastApplied >= index {
 			reply.Err = OK
@@ -143,6 +155,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.db = make(map[string]DbValue)
+	kv.clientSeq = make(map[int64]int64)
 	kv.cond = sync.NewCond(&kv.mu)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
@@ -172,24 +185,23 @@ func (kv *KVServer) apply() {
 			case "Put":
 				kv.db[op.Key] = DbValue{
 					value: op.Value,
-					seq: op.Seq,
 				}
 			case "Append":
 				oldValue, ok := kv.db[op.Key]
 				if ok {
 					// Detect duplicate reqs.
-					if oldValue.seq != op.Seq {
+					oldSeq, ok2 := kv.clientSeq[op.ClientId]
+					if !ok2 || op.Seq != oldSeq {
 						kv.db[op.Key] = DbValue{
 							value: oldValue.value + op.Value,
-							seq: op.Seq,
 						}
 					}
 				} else {
 					kv.db[op.Key] = DbValue{
 						value: op.Value,
-						seq: op.Seq,
 					}
 				}
+				kv.clientSeq[op.ClientId] = op.Seq
 			}
 			kv.lastApplied = m.CommandIndex
 			kv.cond.Broadcast()

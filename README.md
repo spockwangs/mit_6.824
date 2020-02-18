@@ -9,6 +9,11 @@ Assignments of MIT [6.824](https://pdos.csail.mit.edu/6.824/schedule.html).
 2. 处理RPC响应时要先判断自己的term是否old，如果是则转为follower状态，不作后续处理；然后再判断响应是
    否过期的，即自从发请求以来状态是否有变化（比如term、nextIndex是否发生变化），如果有则忽略这个响应。
 3. 每个RPC请求应该是异步的，防止某个RPC过慢阻塞其它的RPC.
+4. 实现linearizable读有两种方法：
+   1. 先提交no-op操作，完成后再读，保证leader有完整的提交日志；
+   2. 刚当选leader时先提交no-op操作，完成后再对外支持读操作，并保证leader在一段时间不能变（比如10s），
+      在这段时间内可以直接支持读操作，不用每次都要提交no-op操作。但是集群要保证各自节点的时钟是高度
+      同步的。
 
 ## 优化点
 
@@ -20,4 +25,3 @@ Assignments of MIT [6.824](https://pdos.csail.mit.edu/6.824/schedule.html).
    AppendEntries携带两次心跳之间应用提交的数据，只是提交数据的延迟会变大。
 3. 提交entry的第二轮交互可以立即开始，不用等待下次心跳触发。处理AppendEntries的响应时如果发现
    commitIndex增加了可以立即触发提交的第二轮交互，可以大大加快提交的速度。
-   
