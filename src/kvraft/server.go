@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"bytes"
 )
 
 const Debug = 0
@@ -85,7 +86,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	
+	DPrintf("PutAppend: %v\n", *args)
 	reply.Err = OK
 	return 
 }
@@ -149,6 +150,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 }
 
 func (kv *KVServer) apply() {
+	ticker := time.NewTicker(5*time.Millisecond)
 	for {
 		select {
 		case m, ok := <- kv.applyCh:
@@ -160,8 +162,8 @@ func (kv *KVServer) apply() {
 			}
 
 			op := m.Command.(Op)
-			DPrintf("received op: %v\n", op)
 			kv.mu.Lock()
+			DPrintf("received op: %v\n", op)
 			switch op.Op {
 			case "Put":
 				kv.db[op.Key] = DbValue{
@@ -187,7 +189,7 @@ func (kv *KVServer) apply() {
 			kv.lastApplied = m.CommandIndex
 			kv.cond.Broadcast()
 			kv.mu.Unlock()
-		default:
+		case <- ticker.C:
 			term, _ := kv.rf.GetState()
 			kv.mu.Lock()
 			if term > kv.term {
@@ -195,7 +197,11 @@ func (kv *KVServer) apply() {
 				kv.cond.Broadcast()
 			}
 			kv.mu.Unlock()
-			time.Sleep(5*time.Millisecond)
+
+			if kv.maxraftstate > 0 && kv.rf.GetStateSize() >= kv.maxraftstate {
+				snapshot_bytes, lastApplied := kv.TakeSnapshot()
+				kv.rf.InstallSnapshot(snapshot_bytes, lastApplied)
+			}
 		}
 	}
 }
@@ -215,4 +221,16 @@ func (kv *KVServer) commit(op Op) bool {
 		kv.cond.Wait()
 	}
 	return false
+}
+
+func (kv *KVServer) TakeSnapshot() ([]byte, int) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.db)
+	e.Encode(kv.clientSeq)
+	e.Encode(kv.lastApplied)
+
+	return w.Bytes(), kv.lastApplied
 }
