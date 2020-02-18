@@ -67,6 +67,7 @@ type Raft struct {
 	currentTerm int
 	votedFor int
 	logs []LogEntry
+	logOffset int		// the absolute index of the first log entry, init to 0
 
 	// Volatile state on all servers.
 	commitIndex int
@@ -108,16 +109,19 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
+	rf.persister.SaveRaftState(rf.writePersist())
+}
+
+func (rf *Raft) writePersist() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.logs)
+	e.Encode(rf.logOffset)
 	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
-}
-
-
+	return data
+}	
 //
 // restore previously persisted state.
 //
@@ -132,9 +136,11 @@ func (rf *Raft) readPersist(data []byte) {
 	var term int
 	var votedFor int
 	var logs []LogEntry
+	var logOffset int
 	if d.Decode(&term) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&logs) != nil {
+		d.Decode(&logs) != nil ||
+		d.Decode(&logOffset) != nil {
 		panic(fmt.Sprintf("decode failed"))
 	} else {
 		rf.currentTerm = term
@@ -210,7 +216,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	lastLogTerm := rf.logs[len(rf.logs)-1].Term
 	if args.LastLogTerm > lastLogTerm ||
-		(args.LastLogTerm == lastLogTerm && args.LastLogIndex + 1 >= len(rf.logs)) {
+		(args.LastLogTerm == lastLogTerm && args.LastLogIndex + 1 >= len(rf.logs) + rf.logOffset) {
 		rf.status = FOLLOWER
 		rf.reschedule(false)
 		rf.votedFor = args.CandidateId
@@ -275,9 +281,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		changed = true
 	}
 	reply.Term = rf.currentTerm
-	if len(rf.logs) <= args.PrevLogIndex {
+	if rf.logOffset + len(rf.logs) <= args.PrevLogIndex {
 		reply.Success = false
-		reply.ConflictIndex = len(rf.logs)
+		reply.ConflictIndex = len(rf.logs) + rf.logOffset
 		reply.ConflictTerm = 0
 		return
 	} else if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
@@ -286,7 +292,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// Find the first entry with term equal to ConflictTerm.
 		reply.ConflictIndex = 0
 		for i := args.PrevLogIndex; i > 0; i-- {
-			if rf.logs[i-1].Term != reply.ConflictTerm {
+			if rf.logs[i-1-rf.logOffset].Term != reply.ConflictTerm {
 				reply.ConflictIndex = i
 			}
 		}
@@ -295,14 +301,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Find the first entry with conflicts.
 	for i, j := args.PrevLogIndex + 1, 0; j < len(args.Entries); i, j = i+1, j+1 {
-		if i >= len(rf.logs) || rf.logs[i].Term != args.Entries[j].Term {
-			rf.logs = append(rf.logs[:i], args.Entries[j:]...)			
+		if i >= len(rf.logs) + rf.logOffset || rf.logs[i-rf.logOffset].Term != args.Entries[j].Term {
+			rf.logs = append(rf.logs[:i-rf.logOffset], args.Entries[j:]...)			
 			changed = true
 			break
 		}
 	}
 	if args.LeaderCommit > rf.commitIndex {
-		newCommitIndex := min(args.LeaderCommit, len(rf.logs)-1)
+		newCommitIndex := min(args.LeaderCommit, len(rf.logs)+rf.logOffset-1)
 		if newCommitIndex > rf.commitIndex {
 			rf.commitIndex = newCommitIndex
 			rf.stateChanged.Broadcast()
@@ -405,7 +411,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Command: command,
 		})
 	changed = true
-	index = len(rf.logs) - 1
+	index = len(rf.logs) + rf.logOffset - 1
 	term = rf.currentTerm
 
 	// Start commit immediately can shorten the commit latency but use RPC bandwidth less
@@ -458,23 +464,25 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.logs = make([]LogEntry, 1)
+	rf.logOffset = 0
+	
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.status = FOLLOWER
 	rf.nextIndex = make([]int, len(rf.peers))
 	for i := range rf.nextIndex {
-		rf.nextIndex[i] = len(rf.logs)
+		rf.nextIndex[i] = len(rf.logs) + rf.logOffset
 	}
 	rf.matchIndex = make([]int, len(rf.peers))
 	for i := range rf.matchIndex {
-		rf.matchIndex[i] = 0
+		rf.matchIndex[i] = rf.logOffset
 	}
 	rf.applyCh = applyCh
 	rf.stateChanged = sync.NewCond(&rf.mu)
 	rf.reschedule(false)
-	
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 
 	go rf.tick()
 	go rf.apply()
@@ -537,7 +545,7 @@ func (rf *Raft) startVotes() {
 	voteReq := RequestVoteArgs{}
 	voteReq.Term = rf.currentTerm
 	voteReq.CandidateId = rf.me
-	voteReq.LastLogIndex = len(rf.logs) - 1
+	voteReq.LastLogIndex = len(rf.logs) + rf.logOffset - 1
 	voteReq.LastLogTerm = rf.logs[len(rf.logs)-1].Term
 
 	votes_mu := sync.Mutex{}
@@ -592,8 +600,8 @@ func (rf *Raft) startVotes() {
 					DPrintf("%v becomes leader\n", rf.me)
 					rf.status = LEADER
 					for i := range rf.nextIndex {
-						rf.nextIndex[i] = len(rf.logs)
-						rf.matchIndex[i] = 0
+						rf.nextIndex[i] = len(rf.logs) + rf.logOffset
+						rf.matchIndex[i] = rf.logOffset
 					}
 					// start heartbeat right now to prevent some
 					// follower from becoming a candidate.
@@ -606,7 +614,7 @@ func (rf *Raft) startVotes() {
 
 // Start to send entries (or heartbeats if entries are empty)  to followers.
 func (rf *Raft) startCommit() {
-	rf.nextIndex[rf.me] = len(rf.logs)
+	rf.nextIndex[rf.me] = len(rf.logs) + rf.logOffset
 	rf.matchIndex[rf.me] = rf.nextIndex[rf.me] - 1
 	rf.reschedule(false)
 	for i, _ := range rf.peers {
@@ -626,10 +634,10 @@ func (rf *Raft) startCommit() {
 					appendEntriesReq.Term = rf.currentTerm
 					appendEntriesReq.LeaderId = rf.me
 					appendEntriesReq.PrevLogIndex = rf.nextIndex[i] - 1
-					appendEntriesReq.PrevLogTerm = rf.logs[rf.nextIndex[i]-1].Term
+					appendEntriesReq.PrevLogTerm = rf.logs[rf.nextIndex[i]-1-rf.logOffset].Term
 					appendEntriesReq.LeaderCommit = rf.commitIndex
-					if len(rf.logs)-1 >= rf.nextIndex[i] {
-						appendEntriesReq.Entries = rf.logs[rf.nextIndex[i]:]
+					if rf.logOffset + len(rf.logs)-1 >= rf.nextIndex[i] {
+						appendEntriesReq.Entries = rf.logs[rf.nextIndex[i]-rf.logOffset:]
 					}
 					return true
 				}()
@@ -679,7 +687,7 @@ func (rf *Raft) startCommit() {
 							return sortedMatchIndex[i] > sortedMatchIndex[j]
 						})
 						for j := sortedMatchIndex[len(rf.peers)/2]; j > rf.commitIndex; j-- {
-							if rf.logs[j].Term == rf.currentTerm {
+							if rf.logs[j-rf.logOffset].Term == rf.currentTerm {
 								rf.commitIndex = j
 								rf.stateChanged.Broadcast()
 								// Start heartbeat right now to tell
@@ -698,7 +706,7 @@ func (rf *Raft) startCommit() {
 						found := false
 						j := rf.nextIndex[i]-2
 						for ; j > 0; j-- {
-							if rf.logs[j].Term == appendEntriesResp.ConflictTerm {
+							if rf.logs[j-rf.logOffset].Term == appendEntriesResp.ConflictTerm {
 								found = true
 								break
 							}
@@ -742,7 +750,8 @@ func (rf *Raft) apply() {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 			if rf.lastApplied < rf.commitIndex {
-				entries = append([]LogEntry{}, rf.logs[rf.lastApplied+1:rf.commitIndex+1]...)
+				entries = append([]LogEntry{},
+					rf.logs[rf.lastApplied+1-rf.logOffset:rf.commitIndex+1-rf.logOffset]...)
 				return
 			}
 			rf.stateChanged.Wait()
@@ -771,4 +780,16 @@ func (rf *Raft) toString() string {
 		s = "LEADER"
 	}
 	return fmt.Sprintf("(term=%v, status=%v, commitIdx=%v)", rf.currentTerm, s, rf.commitIndex)
+}
+
+func (rf *Raft) GetStateSize() int {
+	return rf.persister.RaftStateSize()
+}
+
+func (rf *Raft) InstallSnapshot(kvSnapshot []byte, lastApplied int) {
+	rf.mu.Lock()
+	rf.logs = append([]LogEntry{}, rf.logs[lastApplied+1:]...)
+	rf.logOffset = lastApplied+1
+	rf.persister.SaveStateAndSnapshot(rf.writePersist(), kvSnapshot)
+	rf.mu.Unlock()
 }
