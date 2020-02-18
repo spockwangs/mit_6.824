@@ -54,58 +54,39 @@ type KVServer struct {
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	index, term, isLeader := kv.rf.Start(Op{
-		Op: "Noop",
-	})
-	if !isLeader {
+	ok := kv.commit(Op{ Op: "Noop" })
+	if !ok {
 		reply.Err = ErrWrongLeader
 		return
 	}
 
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	for kv.term <= term {
-		if kv.lastApplied >= index {
-			value, ok := kv.db[args.Key]
-			if ok {
-				reply.Value = value.value
-				reply.Err = OK
-			} else {
-				reply.Value = ""
-				reply.Err = ErrNoKey
-			}
-			return
-		}
-		kv.cond.Wait()
+	value, ok := kv.db[args.Key]
+	if ok {
+		reply.Value = value.value
+		reply.Err = OK
+	} else {
+		reply.Value = ""
+		reply.Err = ErrNoKey
 	}
-	reply.Err = ErrWrongLeader
-	return 
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	index, term, isLeader := kv.rf.Start(Op{
+	ok := kv.commit(Op{
 		Op: args.Op,
 		Key: args.Key,
 		Value: args.Value,
 		Seq: args.Seq,
 		ClientId: args.ClientId,
 	})
-	if !isLeader {
+	if !ok {
 		reply.Err = ErrWrongLeader
 		return
 	}
 	
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	for kv.term <= term {
-		if kv.lastApplied >= index {
-			reply.Err = OK
-			return
-		}
-		kv.cond.Wait()
-	}
-	reply.Err = ErrWrongLeader
+	reply.Err = OK
 	return 
 }
 
@@ -217,4 +198,21 @@ func (kv *KVServer) apply() {
 			time.Sleep(5*time.Millisecond)
 		}
 	}
+}
+
+func (kv *KVServer) commit(op Op) bool {
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		return false
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	for kv.term <= term {
+		if kv.lastApplied >= index {
+			return true
+		}
+		kv.cond.Wait()
+	}
+	return false
 }
