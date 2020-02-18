@@ -749,12 +749,11 @@ func (rf *Raft) apply() {
 		func() {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			if rf.lastApplied < rf.commitIndex {
-				entries = append([]LogEntry{},
-					rf.logs[rf.lastApplied+1-rf.logOffset:rf.commitIndex+1-rf.logOffset]...)
-				return
+			for rf.lastApplied >= rf.commitIndex {
+				rf.stateChanged.Wait()
 			}
-			rf.stateChanged.Wait()
+			entries = append([]LogEntry{},
+				rf.logs[rf.lastApplied+1-rf.logOffset:rf.commitIndex+1-rf.logOffset]...)
 		}()
 		if entries != nil {
 			for _, entry := range entries {
