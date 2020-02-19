@@ -762,6 +762,7 @@ func (rf *Raft) apply() {
 					CommandValid: true,
 						Command: entry.Command,
 						CommandIndex: rf.lastApplied,
+						Term: rf.currentTerm,
 					}
 			}
 		}

@@ -86,7 +86,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	DPrintf("PutAppend: %v\n", *args)
 	reply.Err = OK
 	return 
 }
@@ -163,7 +162,7 @@ func (kv *KVServer) apply() {
 
 			op := m.Command.(Op)
 			kv.mu.Lock()
-			DPrintf("received op: %v\n", op)
+			DPrintf("received op: index=%v %v\n", m.CommandIndex, op)
 			switch op.Op {
 			case "Put":
 				kv.db[op.Key] = DbValue{
@@ -187,9 +186,10 @@ func (kv *KVServer) apply() {
 				kv.clientSeq[op.ClientId] = op.Seq
 			}
 			kv.lastApplied = m.CommandIndex
+			kv.term = m.Term
 			kv.cond.Broadcast()
 			kv.mu.Unlock()
-		case <- ticker.C:
+		case <-ticker.C:
 			term, _ := kv.rf.GetState()
 			kv.mu.Lock()
 			if term > kv.term {
@@ -197,7 +197,7 @@ func (kv *KVServer) apply() {
 				kv.cond.Broadcast()
 			}
 			kv.mu.Unlock()
-
+			
 			if kv.maxraftstate > 0 && kv.rf.GetStateSize() >= kv.maxraftstate {
 				snapshot_bytes, lastApplied := kv.TakeSnapshot()
 				kv.rf.InstallSnapshot(snapshot_bytes, lastApplied)
@@ -212,14 +212,17 @@ func (kv *KVServer) commit(op Op) bool {
 		return false
 	}
 
+	DPrintf("commit op: index=%v, %v\n", index, op)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	for kv.term <= term {
 		if kv.lastApplied >= index {
+			DPrintf("commit op: index=%v, %v, true\n", index, op)
 			return true
 		}
 		kv.cond.Wait()
 	}
+	DPrintf("commit op: index=%v, %v, false\n", index, op)
 	return false
 }
 
