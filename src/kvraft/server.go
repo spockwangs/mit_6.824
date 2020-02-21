@@ -164,28 +164,28 @@ func (kv *KVServer) apply() {
 			} else {
 				op := m.Command.(Op)
 				DPrintf("received op: index=%v %v\n", m.CommandIndex, op)
-				switch op.Op {
-				case "Put":
-					kv.db[op.Key] = DbValue{
-						Value: op.Value,
-					}
-				case "Append":
-					oldValue, ok := kv.db[op.Key]
-					if ok {
-						// Detect duplicate reqs.
-						oldSeq, ok2 := kv.clientSeq[op.ClientId]
-						if !ok2 || op.Seq != oldSeq {
-							kv.db[op.Key] = DbValue{
-								Value: oldValue.Value + op.Value,
-							}
-						}
-					} else {
+				// Detect duplicate reqs.
+				oldSeq, ok := kv.clientSeq[op.ClientId]
+				if !ok || op.Seq != oldSeq {
+					switch op.Op {
+					case "Put":
 						kv.db[op.Key] = DbValue{
 							Value: op.Value,
 						}
+					case "Append":
+						oldValue, ok := kv.db[op.Key]
+						if ok {
+							kv.db[op.Key] = DbValue{
+								Value: oldValue.Value + op.Value,
+							}
+						} else {
+							kv.db[op.Key] = DbValue{
+								Value: op.Value,
+							}
+						}
 					}
-					kv.clientSeq[op.ClientId] = op.Seq
 				}
+				kv.clientSeq[op.ClientId] = op.Seq
 			}
 			kv.lastIncludedIndex = m.CommandIndex
 			kv.lastIncludedTerm = m.Term

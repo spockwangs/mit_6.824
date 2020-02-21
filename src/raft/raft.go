@@ -322,9 +322,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if i <= rf.lastIncludedIndex {
 			continue
 		}
-		if i > rf.getLastIndex() ||
-			rf.getEntry(i).Term != args.Entries[j].Term {
-			rf.logs = append(rf.logs[:rf.getRelativeIndex(i)], args.Entries[j:]...)			
+		if i > rf.getLastIndex() {
+			rf.logs = append(rf.logs, args.Entries[j:]...)
+			changed = true
+			break
+		} else if rf.getEntry(i).Term != args.Entries[j].Term {
+			rf.logs = append(rf.getEntries(-1, i), args.Entries[j:]...)
 			changed = true
 			break
 		}
@@ -448,11 +451,8 @@ func (rf *Raft) InstallSnapshot(
 		(rf.getStartIndex() <= args.LastIncludedIndex &&
 			rf.getEntry(args.LastIncludedIndex).Term != args.LastIncludedTerm) {
 		rf.logs = []LogEntry{}
-	} else {
-		i := rf.getRelativeIndex(args.LastIncludedIndex)
-		if i >= 0 {
-			rf.logs = rf.logs[i+1:]
-		}
+	} else if args.LastIncludedIndex >= rf.getStartIndex() {
+		rf.logs = rf.getEntries(args.LastIncludedIndex+1, -1)
 	}
 	rf.lastIncludedIndex = args.LastIncludedIndex
 	rf.lastIncludedTerm = args.LastIncludedTerm
@@ -796,7 +796,7 @@ func (rf *Raft) makeCommitReq(
 	}
 	appendEntriesArgs.LeaderCommit = rf.commitIndex
 	if rf.nextIndex[peer] <= rf.getLastIndex() {
-		appendEntriesArgs.Entries = rf.logs[rf.getRelativeIndex(rf.nextIndex[peer]):]
+		appendEntriesArgs.Entries = rf.getEntries(rf.nextIndex[peer], -1)
 	}
 	return 0
 }
@@ -933,12 +933,7 @@ func (rf *Raft) apply() {
 				rf.stateChanged.Wait()
 			}
 			if rf.lastApplied + 1 >= rf.getStartIndex() {
-				if len(rf.logs) == 0 {
-					log.Fatalf("lastApplied=%v commitIndex=%v startIndex=%v lastIndex=%v\n",
-						rf.lastApplied, rf.commitIndex, rf.getStartIndex(), rf.getLastIndex())
-				}
-				entries = append([]LogEntry{},
-					rf.logs[rf.getRelativeIndex(rf.lastApplied+1):rf.getRelativeIndex(rf.commitIndex+1)]...)
+				entries = rf.getEntries(rf.lastApplied+1, rf.commitIndex+1)
 			}
 			rf.checkInv()
 		}()
@@ -1000,16 +995,11 @@ func (rf *Raft) saveStateAndSnapshotWithoutLock(
 		log.Fatalf("lastApplied=%v lastIndex=%v\n", lastApplied, rf.getLastIndex())
 	}
 	
-	i := rf.getRelativeIndex(lastApplied)
-	rf.logs = rf.logs[i+1:]
+	rf.logs = rf.getEntries(lastApplied+1, -1)
 	rf.lastIncludedIndex = lastApplied
 	rf.lastIncludedTerm = lastAppliedTerm
 	rf.persister.SaveStateAndSnapshot(rf.writePersist(), kvSnapshot)
 	rf.readPersist(rf.persister.ReadRaftState())
-}
-
-func (rf *Raft) getRelativeIndex(i int) int {
-	return i - rf.lastIncludedIndex - 1
 }
 
 func (rf *Raft) getEntry(i int) *LogEntry {
@@ -1021,10 +1011,22 @@ func (rf *Raft) getEntry(i int) *LogEntry {
 }
 
 func (rf *Raft) getEntries(i, j int) []LogEntry {
-	if i < rf.getStartIndex() || i > rf.getLastIndex() {
-		log.Fatalf("index %v out of bounds\n", i)
+	if j >= 0 && i >= 0 && i > j {
+		log.Fatalf("%v > %v\n", i, j)
 	}
-	return rf.logs[i:j+1]
+	if i >= 0 && (i < rf.getStartIndex() || i > rf.getLastIndex()) {
+		log.Fatalf("index %v out of bounds j=%v\n", i, j)
+	}
+	if i < 0 {
+		i = 0
+	} else {
+		i -= rf.getStartIndex()
+	}
+	if j < 0 {
+		return rf.logs[i:]
+	}
+	j -= rf.getStartIndex()
+	return rf.logs[i:j]
 }
 
 func (rf *Raft) getStartIndex() int {
@@ -1053,4 +1055,3 @@ func (rf *Raft) check(exp bool) {
 		panic(fmt.Sprintf("%v\n", rf.toString()))
 	}
 }
-	
