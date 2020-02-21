@@ -836,25 +836,22 @@ func (rf *Raft) handleAppendEntriesResp(
 		rf.advanceCommitIndex()
 		return false
 	}
+
 	// AppendEntries fails because of log inconsistency.
-	if appendEntriesReq.Term >= appendEntriesResp.Term {
-		// oldNextIndex := rf.nextIndex[peer]
-		found := false
-		j := rf.nextIndex[peer]-2
-		for ; j >= rf.getStartIndex(); j-- {
-			if rf.getEntry(j).Term == appendEntriesResp.ConflictTerm {
-				found = true
-				break
-			}
+	found := false
+	j := rf.nextIndex[peer]-2
+	for ; j >= rf.getStartIndex(); j-- {
+		if rf.getEntry(j).Term == appendEntriesResp.ConflictTerm {
+			found = true
+			break
 		}
-		if found {
-			rf.nextIndex[peer] = j + 1
-		} else {
-			rf.nextIndex[peer] = appendEntriesResp.ConflictIndex
-		}
-		return true
 	}
-	return false
+	if found {
+		rf.nextIndex[peer] = j + 1
+	} else {
+		rf.nextIndex[peer] = appendEntriesResp.ConflictIndex
+	}
+	return true
 }
 
 func (rf *Raft) handleInstallSnapshotResp(
