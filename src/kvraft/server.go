@@ -34,7 +34,7 @@ type Op struct {
 }
 
 type DbValue struct {
-	value string
+	Value string
 }
 type KVServer struct {
 	mu      sync.Mutex
@@ -66,7 +66,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	defer kv.mu.Unlock()
 	value, ok := kv.db[args.Key]
 	if ok {
-		reply.Value = value.value
+		reply.Value = value.Value
 		reply.Err = OK
 	} else {
 		reply.Value = ""
@@ -157,35 +157,35 @@ func (kv *KVServer) apply() {
 			if !ok {
 				return
 			}
-			if !m.CommandValid {
-				kv.readSnapshot(m.Snapshot, m.CommandIndex, m.Term)
-				continue
-			}
-
-			op := m.Command.(Op)
 			kv.mu.Lock()
-			DPrintf("received op: index=%v %v\n", m.CommandIndex, op)
-			switch op.Op {
-			case "Put":
-				kv.db[op.Key] = DbValue{
-					value: op.Value,
-				}
-			case "Append":
-				oldValue, ok := kv.db[op.Key]
-				if ok {
-					// Detect duplicate reqs.
-					oldSeq, ok2 := kv.clientSeq[op.ClientId]
-					if !ok2 || op.Seq != oldSeq {
+			if !m.CommandValid {
+				DPrintf("received snapshot: index=%v\n", m.CommandIndex)
+				kv.readSnapshot(m.Snapshot)
+			} else {
+				op := m.Command.(Op)
+				DPrintf("received op: index=%v %v\n", m.CommandIndex, op)
+				switch op.Op {
+				case "Put":
+					kv.db[op.Key] = DbValue{
+						Value: op.Value,
+					}
+				case "Append":
+					oldValue, ok := kv.db[op.Key]
+					if ok {
+						// Detect duplicate reqs.
+						oldSeq, ok2 := kv.clientSeq[op.ClientId]
+						if !ok2 || op.Seq != oldSeq {
+							kv.db[op.Key] = DbValue{
+								Value: oldValue.Value + op.Value,
+							}
+						}
+					} else {
 						kv.db[op.Key] = DbValue{
-							value: oldValue.value + op.Value,
+							Value: op.Value,
 						}
 					}
-				} else {
-					kv.db[op.Key] = DbValue{
-						value: op.Value,
-					}
+					kv.clientSeq[op.ClientId] = op.Seq
 				}
-				kv.clientSeq[op.ClientId] = op.Seq
 			}
 			kv.lastIncludedIndex = m.CommandIndex
 			kv.lastIncludedTerm = m.Term
@@ -245,13 +245,10 @@ func (kv *KVServer) takeSnapshot() (snapshot []byte, lastIncludedIndex, lastIncl
 	return
 }
 
-func (kv *KVServer) readSnapshot(data []byte, lastIncludedIndex, lastIncludedTerm int) {
+func (kv *KVServer) readSnapshot(data []byte) {
 	if data == nil || len(data) < 1 {
 		return
 	}
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var db map[string]DbValue
@@ -263,6 +260,4 @@ func (kv *KVServer) readSnapshot(data []byte, lastIncludedIndex, lastIncludedTer
 		kv.db = db
 		kv.clientSeq = clientSeq
 	}
-	kv.lastIncludedIndex = lastIncludedIndex
-	kv.lastIncludedTerm = lastIncludedTerm
 }
