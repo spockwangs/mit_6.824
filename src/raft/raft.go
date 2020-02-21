@@ -80,7 +80,7 @@ type Raft struct {
 	// Volatile state on leaders
 	nextIndex []int		// map peer's index to its next index
 	matchIndex []int 	// map peer's index to its highest replicated log entry
-	stateChanged *sync.Cond	// predicate: killed or term changed or logs appended
+	stateChanged *sync.Cond	// predicate: killed or term changed or commitIndex adavanced
 }
 type LogEntry struct {
 	Command interface{}
@@ -389,6 +389,52 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+type InstallSnapshotArgs struct {
+	Term int
+	LeaderId int
+	LastIncludedIndex int
+	LastIncludedTerm int
+	Data []byte
+}
+
+func (args *InstallSnapshotArgs) toString() string {
+	return fmt.Sprintf("(Term=%v LeaderId=%v LastIncludedIndex=%v LastIncludedTerm=%v)",
+		args.Term, args.LeaderId, args.LastIncludedIndex, args.LastIncludedTerm)
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (reply *InstallSnapshotReply) toString() string {
+	return fmt.Sprintf("(Term=%v)", reply.Term)
+}
+
+func (rf *Raft) InstallSnapshot(
+	args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	rf.saveStateAndSnapshotWithoutLock(
+		args.Data, args.LastIncludedIndex, args.LastIncludedTerm)
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	if rf.killed() {
+		return false
+	}
+	rf.mu.Lock()
+	DPrintf("me=%v%v, to=%v, install=%v, reply=%v, ok=%v\n",
+		rf.me, rf.toString(), server, args.toString(), reply.toString(), ok)
+	rf.mu.Unlock()
+	return ok
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -647,114 +693,179 @@ func (rf *Raft) startCommit() {
 
 		go func(i int) {
 			for {
-				appendEntriesReq := AppendEntriesArgs{}
-				ok := func () bool {
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
-					if rf.status != LEADER {
-						return false
-					}
-					appendEntriesReq.Term = rf.currentTerm
-					appendEntriesReq.LeaderId = rf.me
-					appendEntriesReq.PrevLogIndex = rf.nextIndex[i] - 1
-					if appendEntriesReq.PrevLogIndex == rf.lastIncludedIndex {
-						appendEntriesReq.PrevLogTerm = rf.lastIncludedTerm
-					} else {
-						appendEntriesReq.PrevLogTerm =
-							rf.logs[rf.getRelativeIndex(appendEntriesReq.PrevLogIndex)].Term
-					}
-					appendEntriesReq.LeaderCommit = rf.commitIndex
-					if rf.nextIndex[i] <= rf.getLastIndex() {
-						appendEntriesReq.Entries = rf.logs[rf.getRelativeIndex(rf.nextIndex[i]):]
-					}
-					return true
-				}()
-				if !ok {
-					return
-				}
-				
-				appendEntriesResp := AppendEntriesReply{}
-				ok = rf.sendAppendEntries(i, &appendEntriesReq, &appendEntriesResp)
-				if !ok {
-					return
-				}
-
-				ok = func () bool {
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
-					changed := false
-					defer func() {
-						if changed {
-							rf.persist()
-						}
-					}()
-					
-					if appendEntriesResp.Term > rf.currentTerm {
-						rf.currentTerm = appendEntriesResp.Term
-						rf.status = FOLLOWER
-						rf.votedFor = -1
-						rf.reschedule(false)
-						changed = true
-						return true
-					}
-					// Skip old resp.
-					if appendEntriesReq.Term != rf.currentTerm {
-						return true
-					}
-					if appendEntriesResp.Success {
-						// Use max() to protect against old resp.
-						rf.matchIndex[i] = max(rf.matchIndex[i],
-							appendEntriesReq.PrevLogIndex + len(appendEntriesReq.Entries))
-						rf.nextIndex[i] = rf.matchIndex[i] + 1
-						DPrintf("me=%v, matchIndex=%v, len(logs)=%v\n",
-							rf.me, rf.matchIndex, len(rf.logs))
-						// Sort matchIndex[] from big to small.
-						sortedMatchIndex := make([]int, len(rf.matchIndex))
-						copy(sortedMatchIndex, rf.matchIndex)
-						sort.Slice(sortedMatchIndex, func(i, j int) bool {
-							return sortedMatchIndex[i] > sortedMatchIndex[j]
-						})
-						for j := sortedMatchIndex[len(rf.peers)/2]; j > rf.commitIndex; j-- {
-							if rf.logs[rf.getRelativeIndex(j)].Term == rf.currentTerm {
-								rf.commitIndex = j
-								rf.stateChanged.Broadcast()
-								// Start heartbeat right now to tell
-								// followers the new commit index
-								// immediately and speed up the
-								// commit process.
-								rf.reschedule(true)
-								break
-							}
-						}
-						return true
-					}
-					// AppendEntries fails because of log inconsistency.
-					if appendEntriesReq.Term >= appendEntriesResp.Term {
-						// oldNextIndex := rf.nextIndex[i]
-						found := false
-						j := rf.nextIndex[i]-2
-						for ; j > 0; j-- {
-							if rf.logs[rf.getRelativeIndex(j)].Term ==
-								appendEntriesResp.ConflictTerm {
-								found = true
-								break
-							}
-						}
-						if found {
-							rf.nextIndex[i] = j + 1
-						} else {
-							rf.nextIndex[i] = appendEntriesResp.ConflictIndex
-						}
-						return false
-					}
-					return true
-				}()
-				if ok {
+				retry := rf.doCommit(i)
+				if !retry {
 					break
 				}
 			}
 		} (i)
 	}
+}
+
+// Send AppendEntries or InstallSnapshot to followers, return true if should retry.
+func (rf *Raft) doCommit(peer int) bool {
+	appendEntriesArgs := AppendEntriesArgs{}
+	installSnapshotArgs := InstallSnapshotArgs{}
+	i := rf.makeCommitReq(peer, &appendEntriesArgs, &installSnapshotArgs)
+	if i < 0 {
+		return false
+	}
+
+	if i == 0 {
+		appendEntriesResp := AppendEntriesReply{}
+		ok := rf.sendAppendEntries(peer, &appendEntriesArgs, &appendEntriesResp)
+		if !ok {
+			return false
+		}
+		retry := rf.handleAppendEntriesResp(peer, &appendEntriesArgs, &appendEntriesResp)
+		return retry
+	}
+
+	installSnapshotResp := InstallSnapshotReply{}
+	ok := rf.sendInstallSnapshot(peer, &installSnapshotArgs, &installSnapshotResp)
+	if !ok {
+		return false
+	}
+	retry := rf.handleInstallSnapshotResp(&installSnapshotArgs, &installSnapshotResp)
+	return retry
+}
+
+func (rf *Raft) makeCommitReq(
+	peer int,
+	appendEntriesArgs *AppendEntriesArgs,
+	installSnapshotArgs *InstallSnapshotArgs) int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.status != LEADER {
+		return -1
+	}
+
+	// Follower落后太多，发送InstallSnapshot.
+	if rf.nextIndex[peer] <= rf.lastIncludedIndex {
+		installSnapshotArgs.Term = rf.currentTerm
+		installSnapshotArgs.LeaderId = rf.me
+		installSnapshotArgs.LastIncludedIndex = rf.lastIncludedIndex
+		installSnapshotArgs.LastIncludedTerm = rf.lastIncludedTerm
+		installSnapshotArgs.Data = rf.persister.ReadSnapshot()
+		return 1
+	}
+	
+	appendEntriesArgs.Term = rf.currentTerm
+	appendEntriesArgs.LeaderId = rf.me
+	appendEntriesArgs.PrevLogIndex = rf.nextIndex[peer] - 1
+	if appendEntriesArgs.PrevLogIndex == rf.lastIncludedIndex {
+		appendEntriesArgs.PrevLogTerm = rf.lastIncludedTerm
+	} else {
+		appendEntriesArgs.PrevLogTerm =
+			rf.logs[rf.getRelativeIndex(appendEntriesArgs.PrevLogIndex)].Term
+	}
+	appendEntriesArgs.LeaderCommit = rf.commitIndex
+	if rf.nextIndex[peer] <= rf.getLastIndex() {
+		appendEntriesArgs.Entries = rf.logs[rf.getRelativeIndex(rf.nextIndex[peer]):]
+	}
+	return 0
+}
+
+func (rf *Raft) handleAppendEntriesResp(
+	peer int,
+	appendEntriesReq *AppendEntriesArgs,
+	appendEntriesResp *AppendEntriesReply) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	changed := false
+	defer func() {
+		if changed {
+			rf.persist()
+		}
+	}()
+	
+	if appendEntriesResp.Term > rf.currentTerm {
+		rf.currentTerm = appendEntriesResp.Term
+		rf.status = FOLLOWER
+		rf.votedFor = -1
+		rf.reschedule(false)
+		changed = true
+		return false
+	}
+	// Skip old resp.
+	if appendEntriesReq.Term != rf.currentTerm {
+		return false
+	}
+	if appendEntriesResp.Success {
+		// Use max() to protect against old resp.
+		rf.matchIndex[peer] = max(rf.matchIndex[peer],
+			appendEntriesReq.PrevLogIndex + len(appendEntriesReq.Entries))
+		rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+		DPrintf("me=%v, matchIndex=%v, len(logs)=%v\n",
+			rf.me, rf.matchIndex, len(rf.logs))
+		// Sort matchIndex[] from big to small.
+		sortedMatchIndex := make([]int, len(rf.matchIndex))
+		copy(sortedMatchIndex, rf.matchIndex)
+		sort.Slice(sortedMatchIndex, func(i, j int) bool {
+			return sortedMatchIndex[i] > sortedMatchIndex[j]
+		})
+		for j := sortedMatchIndex[len(rf.peers)/2]; j > rf.commitIndex; j-- {
+			if rf.logs[rf.getRelativeIndex(j)].Term == rf.currentTerm {
+				rf.commitIndex = j
+				rf.stateChanged.Broadcast()
+				// Start heartbeat right now to tell
+				// followers the new commit index
+				// immediately and speed up the
+				// commit process.
+				rf.reschedule(true)
+				break
+			}
+		}
+		return false
+	}
+	// AppendEntries fails because of log inconsistency.
+	if appendEntriesReq.Term >= appendEntriesResp.Term {
+		// oldNextIndex := rf.nextIndex[peer]
+		found := false
+		j := rf.nextIndex[peer]-2
+		for ; j > 0; j-- {
+			if rf.logs[rf.getRelativeIndex(j)].Term ==
+				appendEntriesResp.ConflictTerm {
+				found = true
+				break
+			}
+		}
+		if found {
+			rf.nextIndex[peer] = j + 1
+		} else {
+			rf.nextIndex[peer] = appendEntriesResp.ConflictIndex
+		}
+		return true
+	}
+	return false
+}
+
+func (rf *Raft) handleInstallSnapshotResp(
+	installSnapshotArgs *InstallSnapshotArgs,
+	installSnapshotResp *InstallSnapshotReply) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	changed := false
+	defer func() {
+		if changed {
+			rf.persist()
+		}
+	}()
+
+	if installSnapshotArgs.Term != rf.currentTerm {
+		return false
+	}
+	if installSnapshotResp.Term > rf.currentTerm {
+		rf.currentTerm = installSnapshotResp.Term
+		rf.status = FOLLOWER
+		rf.votedFor = -1
+		rf.reschedule(false)
+		changed = true
+		return false
+	}
+	return false
 }
 
 func min(a, b int) int {
@@ -815,12 +926,24 @@ func (rf *Raft) GetStateSize() int {
 	return rf.persister.RaftStateSize()
 }
 
-func (rf *Raft) InstallSnapshot(kvSnapshot []byte, lastApplied int) {
+func (rf *Raft) SaveStateAndSnapshot(
+	kvSnapshot []byte, lastApplied int, lastAppliedTerm int) {
 	rf.mu.Lock()
-	rf.logs = rf.logs[rf.getRelativeIndex(lastApplied+1):]
-	rf.lastIncludedIndex = lastApplied
-	rf.persister.SaveStateAndSnapshot(rf.writePersist(), kvSnapshot)
+	rf.saveStateAndSnapshotWithoutLock(kvSnapshot, lastApplied, lastAppliedTerm)
 	rf.mu.Unlock()
+}
+
+func (rf *Raft) saveStateAndSnapshotWithoutLock(
+	kvSnapshot []byte, lastApplied int, lastAppliedTerm int) {
+	i := rf.getRelativeIndex(lastApplied)
+	if i >= 0 && i < len(rf.logs) && rf.logs[i].Term == lastAppliedTerm {
+		rf.logs = rf.logs[i+1:]
+	} else {
+		rf.logs = []LogEntry{}
+	}
+	rf.lastIncludedIndex = lastApplied
+	rf.lastIncludedTerm = lastAppliedTerm
+	rf.persister.SaveStateAndSnapshot(rf.writePersist(), kvSnapshot)
 }
 
 func (rf *Raft) getRelativeIndex(i int) int {
