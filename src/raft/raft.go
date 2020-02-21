@@ -44,6 +44,7 @@ type ApplyMsg struct {
 	Command      interface{}
 	CommandIndex int
 	Term int
+	Snapshot []byte
 }
 
 //
@@ -884,6 +885,20 @@ func max(a, b int) int {
 
 // Apply commited log entries periodically.
 func (rf *Raft) apply() {
+	rf.mu.Lock()
+	snapshot := rf.persister.ReadSnapshot()
+	lastIncludedIndex := rf.lastIncludedIndex
+	lastIncludedTerm := rf.lastIncludedTerm
+	rf.mu.Unlock()
+	if len(snapshot) > 0 {
+		rf.applyCh <- ApplyMsg{
+			CommandValid: false,
+			CommandIndex: lastIncludedIndex,
+			Term: lastIncludedTerm,
+			Snapshot: snapshot,
+		}
+	}
+
 	for {
 		var entries []LogEntry
 		func() {

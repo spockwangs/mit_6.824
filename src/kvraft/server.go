@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 	"bytes"
+	"fmt"
 )
 
 const Debug = 0
@@ -47,11 +48,11 @@ type KVServer struct {
 	// Your definitions here.
 	db map[string]DbValue
 	clientSeq map[int64]int64 // client id => last op seq
-	lastApplied int
-	term int
-	cond *sync.Cond		// predicate: term changed or lastApplied changed
+	lastIncludedIndex int
+	lastIncludedTerm int
+	cond *sync.Cond		// predicate: currentTerm changed or lastIncludedIndex changed
+	currentTerm int
 }
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
@@ -157,6 +158,7 @@ func (kv *KVServer) apply() {
 				return
 			}
 			if !m.CommandValid {
+				kv.readSnapshot(m.Snapshot, m.CommandIndex, m.Term)
 				continue
 			}
 
@@ -185,22 +187,25 @@ func (kv *KVServer) apply() {
 				}
 				kv.clientSeq[op.ClientId] = op.Seq
 			}
-			kv.lastApplied = m.CommandIndex
-			kv.term = m.Term
+			kv.lastIncludedIndex = m.CommandIndex
+			kv.lastIncludedTerm = m.Term
+			if kv.lastIncludedTerm > kv.currentTerm {
+				kv.currentTerm = kv.lastIncludedTerm
+			}
 			kv.cond.Broadcast()
 			kv.mu.Unlock()
 		case <-ticker.C:
 			term, _ := kv.rf.GetState()
 			kv.mu.Lock()
-			if term > kv.term {
-				kv.term = term
+			if term > kv.currentTerm {
+				kv.currentTerm = term
 				kv.cond.Broadcast()
 			}
 			kv.mu.Unlock()
 			
 			if kv.maxraftstate > 0 && kv.rf.GetStateSize() >= kv.maxraftstate {
-				snapshot_bytes, lastApplied := kv.TakeSnapshot()
-				kv.rf.InstallSnapshot(snapshot_bytes, lastApplied)
+				snapshot, lastIncludedIndex, lastIncludedTerm := kv.takeSnapshot()
+				kv.rf.SaveStateAndSnapshot(snapshot, lastIncludedIndex, lastIncludedTerm)
 			}
 		}
 	}
@@ -215,8 +220,8 @@ func (kv *KVServer) commit(op Op) bool {
 	DPrintf("commit op: index=%v, %v\n", index, op)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	for kv.term <= term {
-		if kv.lastApplied >= index {
+	for kv.currentTerm <= term {
+		if kv.lastIncludedIndex >= index {
 			DPrintf("commit op: index=%v, %v, true\n", index, op)
 			return true
 		}
@@ -226,14 +231,38 @@ func (kv *KVServer) commit(op Op) bool {
 	return false
 }
 
-func (kv *KVServer) TakeSnapshot() ([]byte, int) {
+func (kv *KVServer) takeSnapshot() (snapshot []byte, lastIncludedIndex, lastIncludedTerm int) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.db)
 	e.Encode(kv.clientSeq)
-	e.Encode(kv.lastApplied)
 
-	return w.Bytes(), kv.lastApplied
+	snapshot = w.Bytes()
+	lastIncludedIndex = kv.lastIncludedIndex
+	lastIncludedTerm = kv.lastIncludedTerm
+	return
+}
+
+func (kv *KVServer) readSnapshot(data []byte, lastIncludedIndex, lastIncludedTerm int) {
+	if data == nil || len(data) < 1 {
+		return
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var db map[string]DbValue
+	var clientSeq map[int64]int64
+	if d.Decode(&db) != nil ||
+		d.Decode(&clientSeq) != nil {
+		panic(fmt.Sprintf("decode failed"))
+	} else {
+		kv.db = db
+		kv.clientSeq = clientSeq
+	}
+	kv.lastIncludedIndex = lastIncludedIndex
+	kv.lastIncludedTerm = lastIncludedTerm
 }
