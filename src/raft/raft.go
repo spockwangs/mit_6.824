@@ -969,8 +969,8 @@ func (rf *Raft) toString() string {
 	case LEADER:
 		s = "LEADER"
 	}
-	return fmt.Sprintf("(me=%v, term=%v, status=%v, commitIdx=%v, lastApplied=%v, lastIncludedIndex=%v, #logs=%v)",
-		rf.me, rf.currentTerm, s, rf.commitIndex, rf.lastApplied, rf.lastIncludedIndex, len(rf.logs))
+	return fmt.Sprintf("(me=%v, term=%v, status=%v, commitIdx=%v, lastIncludedIndex=%v, #logs=%v)",
+		rf.me, rf.currentTerm, s, rf.commitIndex, rf.lastIncludedIndex, len(rf.logs))
 }
 
 func (rf *Raft) GetStateSize() int {
