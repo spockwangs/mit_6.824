@@ -447,7 +447,7 @@ func (rf *Raft) InstallSnapshot(
 		return
 	}
 	
-	if args.LastIncludedIndex > rf.getLastIndex() ||
+	if args.LastIncludedIndex >= rf.getLastIndex() ||
 		(rf.getStartIndex() <= args.LastIncludedIndex &&
 			rf.getEntry(args.LastIncludedIndex).Term != args.LastIncludedTerm) {
 		rf.logs = []LogEntry{}
@@ -995,7 +995,11 @@ func (rf *Raft) saveStateAndSnapshotWithoutLock(
 		log.Fatalf("lastApplied=%v lastIndex=%v\n", lastApplied, rf.getLastIndex())
 	}
 	
-	rf.logs = rf.getEntries(lastApplied+1, -1)
+	if lastApplied == rf.getLastIndex() {
+		rf.logs = []LogEntry{}
+	} else {
+		rf.logs = rf.getEntries(lastApplied+1, -1)
+	}
 	rf.lastIncludedIndex = lastApplied
 	rf.lastIncludedTerm = lastAppliedTerm
 	rf.persister.SaveStateAndSnapshot(rf.writePersist(), kvSnapshot)
@@ -1012,10 +1016,11 @@ func (rf *Raft) getEntry(i int) *LogEntry {
 
 func (rf *Raft) getEntries(i, j int) []LogEntry {
 	if j >= 0 && i >= 0 && i > j {
-		log.Fatalf("%v > %v\n", i, j)
+		log.Panic(fmt.Sprintf("%v > %v\n", i, j))
 	}
 	if i >= 0 && (i < rf.getStartIndex() || i > rf.getLastIndex()) {
-		log.Fatalf("index %v out of bounds j=%v\n", i, j)
+		log.Panic(fmt.Sprintf("index %v out of bounds [%v, %v], j=%v\n",
+			i, rf.getStartIndex(), rf.getLastIndex(), j))
 	}
 	if i < 0 {
 		i = 0

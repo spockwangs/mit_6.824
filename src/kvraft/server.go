@@ -33,6 +33,15 @@ type Op struct {
 	Seq int64
 }
 
+type OpResult struct {
+	err Err
+}
+
+type OpResultCh struct {
+	opResultCh chan OpResult
+	refCnt int
+}
+
 type DbValue struct {
 	Value string
 }
@@ -52,13 +61,14 @@ type KVServer struct {
 	lastIncludedTerm int
 	cond *sync.Cond		// predicate: currentTerm changed or lastIncludedIndex changed
 	currentTerm int
+	opResultChs map[int]OpResultCh
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	ok := kv.commit(Op{ Op: "Noop" })
-	if !ok {
-		reply.Err = ErrWrongLeader
+	opResult := kv.commit(Op{ Op: "Noop" })
+	if opResult.err != OK {
+		reply.Err = opResult.err
 		return
 	}
 
@@ -76,19 +86,15 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	ok := kv.commit(Op{
+	opResult := kv.commit(Op{
 		Op: args.Op,
 		Key: args.Key,
 		Value: args.Value,
 		Seq: args.Seq,
 		ClientId: args.ClientId,
 	})
-	if !ok {
-		reply.Err = ErrWrongLeader
-		return
-	}
-	reply.Err = OK
-	return 
+	reply.Err = opResult.err
+	return
 }
 
 //
@@ -141,6 +147,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.cond = sync.NewCond(&kv.mu)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.opResultChs = make(map[int]OpResultCh)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
@@ -164,28 +171,12 @@ func (kv *KVServer) apply() {
 			} else {
 				op := m.Command.(Op)
 				DPrintf("received op: index=%v %v\n", m.CommandIndex, op)
-				// Detect duplicate reqs.
-				oldSeq, ok := kv.clientSeq[op.ClientId]
-				if !ok || op.Seq != oldSeq {
-					switch op.Op {
-					case "Put":
-						kv.db[op.Key] = DbValue{
-							Value: op.Value,
-						}
-					case "Append":
-						oldValue, ok := kv.db[op.Key]
-						if ok {
-							kv.db[op.Key] = DbValue{
-								Value: oldValue.Value + op.Value,
-							}
-						} else {
-							kv.db[op.Key] = DbValue{
-								Value: op.Value,
-							}
-						}
-					}
+				opResult := kv.handleOp(op)
+				if opResultCh, ok := kv.opResultChs[m.CommandIndex]; ok {
+					kv.mu.Unlock()
+					opResultCh.opResultCh <- opResult
+					kv.mu.Lock()
 				}
-				kv.clientSeq[op.ClientId] = op.Seq
 			}
 			kv.lastIncludedIndex = m.CommandIndex
 			kv.lastIncludedTerm = m.Term
@@ -211,24 +202,65 @@ func (kv *KVServer) apply() {
 	}
 }
 
-func (kv *KVServer) commit(op Op) bool {
+func (kv *KVServer) handleOp(op Op) OpResult {
+
+	// Detect duplicate reqs.
+	oldSeq, ok := kv.clientSeq[op.ClientId]
+	if ok && op.Seq == oldSeq {
+		return OpResult{ err: OK }
+	}
+	
+	switch op.Op {
+	case "Put":
+		kv.db[op.Key] = DbValue{
+			Value: op.Value,
+		}
+	case "Append":
+		oldValue, ok := kv.db[op.Key]
+		if ok {
+			kv.db[op.Key] = DbValue{
+				Value: oldValue.Value + op.Value,
+			}
+		} else {
+			kv.db[op.Key] = DbValue{
+				Value: op.Value,
+			}
+		}
+	}
+	kv.clientSeq[op.ClientId] = op.Seq
+	return OpResult{ err: OK }
+}
+
+func (kv *KVServer) commit(op Op) OpResult {
 	index, term, isLeader := kv.rf.Start(op)
 	if !isLeader {
-		return false
+		return OpResult{ err: ErrWrongLeader }
 	}
 
 	DPrintf("commit op: index=%v, %v\n", index, op)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	opResultCh, ok := kv.opResultChs[index]
+	if ok {
+		opResultCh.refCnt++
+		kv.opResultChs[index] = opResultCh
+	} else {
+		opResultCh = OpResultCh{
+			opResultCh: make(chan OpResult, 1),
+			refCnt: 1,
+		}
+		kv.opResultChs[index] = opResultCh
+	}
 	for kv.currentTerm <= term {
 		if kv.lastIncludedIndex >= index {
 			DPrintf("commit op: index=%v, %v, true\n", index, op)
-			return true
+			opResult := <- opResultCh.opResultCh
+			return opResult
 		}
 		kv.cond.Wait()
 	}
 	DPrintf("commit op: index=%v, %v, false\n", index, op)
-	return false
+	return OpResult{ err: ErrWrongLeader }
 }
 
 func (kv *KVServer) takeSnapshot() (snapshot []byte, lastIncludedIndex, lastIncludedTerm int) {
