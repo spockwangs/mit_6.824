@@ -164,6 +164,9 @@ func (kv *KVServer) apply() {
 			if !ok {
 				return
 			}
+
+			var opResult OpResult
+			var opResultCh chan OpResult
 			kv.mu.Lock()
 			if !m.CommandValid {
 				DPrintf("received snapshot: index=%v\n", m.CommandIndex)
@@ -171,11 +174,9 @@ func (kv *KVServer) apply() {
 			} else {
 				op := m.Command.(Op)
 				DPrintf("received op: index=%v %v\n", m.CommandIndex, op)
-				opResult := kv.handleOp(op)
-				if opResultCh, ok := kv.opResultChs[m.CommandIndex]; ok {
-					kv.mu.Unlock()
-					opResultCh.opResultCh <- opResult
-					kv.mu.Lock()
+				opResult = kv.handleOp(op)
+				if ch, ok := kv.opResultChs[m.CommandIndex]; ok {
+					opResultCh = ch.opResultCh
 				}
 			}
 			kv.lastIncludedIndex = m.CommandIndex
@@ -185,6 +186,10 @@ func (kv *KVServer) apply() {
 			}
 			kv.cond.Broadcast()
 			kv.mu.Unlock()
+			// 在Op处理完之后才通知client，防止死锁。
+			if opResultCh != nil {
+				opResultCh <- opResult
+			}
 		case <-ticker.C:
 			term, _ := kv.rf.GetState()
 			kv.mu.Lock()
@@ -249,7 +254,7 @@ func (kv *KVServer) commit(op Op) OpResult {
 		kv.opResultChs[index] = opResultCh
 	} else {
 		opResultCh = OpResultCh{
-			opResultCh: make(chan OpResult, 1),
+			opResultCh: make(chan OpResult),
 			refCnt: 1,
 		}
 		kv.opResultChs[index] = opResultCh
