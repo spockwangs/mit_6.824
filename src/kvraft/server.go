@@ -240,7 +240,9 @@ func (kv *KVServer) commit(op Op) OpResult {
 	DPrintf("commit op: index=%v, %v\n", index, op)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	// TODO: delete opResultCh
+	// 虽然多个提交可能会使用同一个index（第一次提交时还是leader，然后立即失去leader角色，然后又
+	// 重新获得leader，又一个client提交，这2次返回的index可能相同），但是最多只有一个client的提
+	// 交会成功，所以只有一个client会从opResultCh收到通知。
 	opResultCh, ok := kv.opResultChs[index]
 	if ok {
 		opResultCh.refCnt++
@@ -252,6 +254,18 @@ func (kv *KVServer) commit(op Op) OpResult {
 		}
 		kv.opResultChs[index] = opResultCh
 	}
+	defer func() {
+		ch, ok := kv.opResultChs[index]
+		if !ok {
+			panic(fmt.Sprintf("index %v of kv.opResultChs does not exist\n", index))
+		}
+		if ch.refCnt == 1 {
+			delete(kv.opResultChs, index)
+		} else {
+			ch.refCnt--
+			kv.opResultChs[index] = ch
+		}
+	}()
 	for kv.currentTerm <= term {
 		if kv.lastIncludedIndex >= index {
 			DPrintf("commit op: index=%v, %v, true\n", index, op)
