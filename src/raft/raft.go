@@ -938,21 +938,27 @@ func (rf *Raft) apply() {
 			rf.checkInv()
 		}()
 		if len(entries) == 0 {
-			rf.applyCh <- ApplyMsg{
+			rf.mu.Lock()
+			msg := ApplyMsg{
 				CommandValid: false,
 				CommandIndex: rf.lastIncludedIndex,
 				Term: rf.lastIncludedTerm,
 				Snapshot: rf.persister.ReadSnapshot(),
 			}
 			rf.lastApplied = rf.lastIncludedIndex
+			rf.mu.Unlock()
+			rf.applyCh <- msg
 		} else {
 			for _, entry := range entries {
+				rf.mu.Lock()
 				rf.lastApplied++
+				lastApplied := rf.lastApplied
+				rf.mu.Unlock()
 				rf.applyCh <- ApplyMsg {
 					CommandValid: true,
 						Command: entry.Command,
-						CommandIndex: rf.lastApplied,
-						Term: rf.currentTerm,
+						CommandIndex: lastApplied,
+						Term: entry.Term,
 					}
 			}
 		}
