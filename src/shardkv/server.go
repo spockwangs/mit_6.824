@@ -441,8 +441,8 @@ func (kv *ShardKV) updateShardConfigRoutine() {
 
 func (kv *ShardKV) transferShards() {
 	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	
+
+	var wg sync.WaitGroup
 	for shard := range kv.shards {
 		gid := kv.shardConfig.Shards[shard]
 		if gid == kv.gid {
@@ -456,16 +456,20 @@ func (kv *ShardKV) transferShards() {
 			Shard: shard,
 		}
 		servers := kv.shardConfig.Groups[transferArgs.DestGid]
-		kv.mu.Unlock()
-		kv.sendTransfer(servers, &transferArgs)
-		kv.commit(Op{
-			Op: "DeleteShard",
-			DeleteShardReq: DeleteShardArgs{
-				Shard: shard,
-			},
-		})
-		kv.mu.Lock()
+		wg.Add(1)
+		go func(shard int) {
+			defer wg.Done()
+			kv.sendTransfer(servers, &transferArgs)
+			kv.commit(Op{
+				Op: "DeleteShard",
+				DeleteShardReq: DeleteShardArgs{
+					Shard: shard,
+				},
+			})
+		}(shard)
 	}
+	kv.mu.Unlock()
+	wg.Wait()
 }
 
 func (kv *ShardKV) sendTransfer(servers []string, args *TransferArgs) {
