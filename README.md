@@ -25,3 +25,18 @@ Assignments of MIT [6.824](https://pdos.csail.mit.edu/6.824/schedule.html).
    AppendEntries携带两次心跳之间应用提交的数据，只是提交数据的延迟会变大。
 3. 提交entry的第二轮交互可以立即开始，不用等待下次心跳触发。处理AppendEntries的响应时如果发现
    commitIndex增加了可以立即触发提交的第二轮交互，可以大大加快提交的速度。
+4. Leader与每个follower的心跳可以按每个follower的进度独立进行，不需要按统一步伐。
+5. 凡是需要提供linearizable的操作都需要经过Raft，不能直接修改状态机的状态。例如，linearizable读就需
+   要提交Raft执行，不能直接读状态机。
+   
+# ShardKV
+
+1. 实现KV时要分清哪些是持久化状态（影响查询结果且重启后不能重建的信息），持久化状态要记录进
+   snapshot. 比如ShardKV的持久化状态包括每个shard的kv、操作去重的状态以及shard的分配config。
+2. 在转移Shard的过程中不要变更config，会导致中间状态过多，实现困难，而且也会引起多余的操作（比如一个
+   shard一开始是给G1，转移还没完成又要转移给G2，导致重复转移）。转移时要处理重复的转移请求（可能有失
+   败而重试）。
+3. 转移shard时要保证以下两点：
+   1. 任何时候只有一个group处理这个shard，在处理请求时要求客户端与服务端的config保持一致可解决这个问题。
+   2. 任何时候shard的owner只有一个。依次按顺序变更config，当shard转移完成（包括把不需要的shard转移出
+      去和等待别的group转移shard给我）之后才变更到下一个config。

@@ -240,6 +240,7 @@ func (kv *KVServer) commit(op Op) OpResult {
 	DPrintf("commit op: index=%v, %v\n", index, op)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	// TODO: delete opResultCh
 	opResultCh, ok := kv.opResultChs[index]
 	if ok {
 		opResultCh.refCnt++

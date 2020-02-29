@@ -73,6 +73,7 @@ func (ck *Clerk) Get(key string) string {
 
 	for {
 		shard := key2shard(key)
+		args.Shard = shard
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
@@ -111,7 +112,9 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 	for {
 		shard := key2shard(key)
+		args.Shard = shard
 		gid := ck.config.Shards[shard]
+		DPrintf("PutAppend: shard=%v gid=%v\n", shard, gid)
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
@@ -137,4 +140,25 @@ func (ck *Clerk) Put(key string, value string) {
 }
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
+}
+
+func (ck *Clerk) Transfer(args *TransferArgs, reply *TransferReply) {
+	for {
+		if servers, ok := ck.config.Groups[args.DestGid]; ok {
+			for si := 0; si < len(servers); si++ {
+				srv := ck.make_end(servers[si])
+				ok := srv.Call("ShardKV.Transfer", args, reply)
+				if ok && reply.Err == OK {
+					return
+				}
+				if ok && reply.Err == ErrWrongGroup {
+					break
+				}
+				// ... not ok, or ErrWrongLeader
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+		// ask master for the latest configuration.
+		ck.config = ck.sm.Query(-1)
+	}
 }

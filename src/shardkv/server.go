@@ -12,30 +12,23 @@ import "time"
 import "bytes"
 import "fmt"
 
-const Debug = 1
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
-		log.Printf(format, a...)
-	}
-	return
-}
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Op string		// "Put" or "Append" or "Noop" or "Config"
-	Key string
-	Value string
-	ClientId int64
-	Seq int64
+	Op string		// "PutAppend", "Get", "Config", or "Transfer"
+	PutAppendReq PutAppendArgs
+	GetReq GetArgs
 	Config shardmaster.Config
-	Shard int
+	TransferReq TransferArgs
+	DeleteShardReq DeleteShardArgs
 }
 
 type OpResult struct {
-	err Err
+	putAppendReply PutAppendReply
+	getReply GetReply
+	transferReply TransferReply
+	deleteShardReply DeleteShardReply
 }
 
 type OpResultCh struct {
@@ -43,7 +36,10 @@ type OpResultCh struct {
 	opResultCh chan OpResult
 }
 
-type Db map[string]string
+type Db struct {
+	Kv map[string]string
+	ClientSeq map[int64]int64
+}
 
 type ShardKV struct {
 	mu           sync.Mutex
@@ -56,58 +52,53 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	opResultCh map[int]OpResultCh
-	shards map[int]Db	  // shard => db
-	clientSeq map[int64]int64 // client id => last op seq
+	// Persistent state.
+	shards map[int]Db	// shard => db
+	shardConfig shardmaster.Config
+	
+	// Volatile state.
+	opResultChs map[int]OpResultCh
 	lastIncludedIndex int
 	lastIncludedTerm int
 	cond *sync.Cond		// predicate: currentTerm changed or lastIncludedIndex changed
 	currentTerm int
-	shardConfig shardmaster.Config
 	dead int32
+	transfering bool	// wait for sending shards to next owner or my shards being sent to me
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	_, ok := kv.commit(Op{ Op: "Noop" })
+	opResult, ok := kv.commit(Op{ Op: "Get", GetReq: *args })
 	if !ok {
 		reply.Err = ErrWrongLeader
 		return
 	}
-
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	db, ok := kv.shards[args.Shard]
-	if !ok {
-		reply.Err = ErrWrongGroup
-		return
-	}
-	value, ok := db[args.Key]
-	if ok {
-		reply.Value = value
-		reply.Err = OK
-	} else {
-		reply.Value = ""
-		reply.Err = ErrNoKey
-	}
+	*reply = opResult.getReply
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	opResult, ok := kv.commit(Op{
-		Op: args.Op,
-		Key: args.Key,
-		Value: args.Value,
-		Seq: args.Seq,
-		ClientId: args.ClientId,
+		Op: "PutAppend",
+		PutAppendReq: *args,
 	})
 	if !ok {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	
-	reply.Err = opResult.err
-	return 
+	*reply = opResult.putAppendReply
+}
+
+func (kv *ShardKV) Transfer(args *TransferArgs, reply *TransferReply) {
+	opResult, ok := kv.commit(Op{
+		Op: "Transfer",
+		TransferReq: *args,
+	})
+	if !ok {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	*reply = opResult.transferReply
 }
 
 //
@@ -168,12 +159,11 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	// Your initialization code here.
 	kv.shards = make(map[int]Db)
-	kv.clientSeq = make(map[int64]int64)
 	kv.cond = sync.NewCond(&kv.mu)
 
 	// Use something like this to talk to the shardmaster:
 	// kv.mck = shardmaster.MakeClerk(kv.masters)
-	kv.opResultCh = make(map[int]OpResultCh)
+	kv.opResultChs = make(map[int]OpResultCh)
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	go kv.apply()
@@ -215,9 +205,11 @@ func (kv *ShardKV) handleApplyMsg(m raft.ApplyMsg) {
 	} else {
 		op := m.Command.(Op)
 		opResult := kv.handleOp(op)
-		kv.rf.GetStateSize
-		DPrintf("handleOp: op=%v opResult=%v\n", op, opResult)
-		if opResultCh, ok := kv.opResultCh[m.CommandIndex]; ok {
+		_, isLeader := kv.rf.GetState()
+		if isLeader {
+			DPrintf("handleOp: gid=%v op=%v opResult=%v\n", kv.gid, op, opResult)
+		}
+		if opResultCh, ok := kv.opResultChs[m.CommandIndex]; ok {
 			kv.mu.Unlock()
 			opResultCh.opResultCh <- opResult
 			kv.mu.Lock()
@@ -233,45 +225,121 @@ func (kv *ShardKV) handleApplyMsg(m raft.ApplyMsg) {
 }
 
 func (kv *ShardKV) handleOp(op Op) OpResult {
-	if op.Op == "Noop" {
-		return OpResult{ err: OK }
-	}
-	if op.Op == "Config" {
-		kv.shardConfig = op.Config
-		return OpResult{ err: OK }
-	}
+	getDb := func (shard int) (Db, bool) {
+		// Stop serving requests if the shard is not assigned to me.
+		if gid := kv.shardConfig.Shards[shard]; gid != kv.gid {
+			return Db{}, false
+		}
 
-	if gid := kv.shardConfig.Shards[op.Shard]; gid != kv.gid {
-		return OpResult{ err: ErrWrongGroup }
-	}
-	db, ok := kv.shards[op.Shard]
-	if !ok {
-		kv.shards[op.Shard] = make(Db)
-		db, _ = kv.shards[op.Shard]
-	}
-
-	// Detect duplicate reqs.
-	oldSeq, ok := kv.clientSeq[op.ClientId]
-	if ok && op.Seq == oldSeq {
-		return OpResult{ err: OK }
+		// Wait for the previous owner to transfer the shard to me before serving requests.
+		db, ok := kv.shards[shard]
+		if !ok {
+			return Db{}, false
+		}
+		return db, true
 	}
 
 	switch op.Op {
-	case "Put":
-		db[op.Key] = op.Value
-	case "Append":
-		oldValue, ok := db[op.Key]
+	case "Config":
+		// Reconfigure one at a time.
+		if kv.shardConfig.Num >= op.Config.Num || kv.transfering {
+			return OpResult{}
+		}
+
+		// For the first config, assign the shards that belongs to me, don't wait for the
+		// previous owner.
+		if op.Config.Num == 1 {
+			for shard, gid := range op.Config.Shards {
+				if gid == kv.gid {
+					kv.shards[shard] = Db{
+						Kv: make(map[string]string),
+						ClientSeq: make(map[int64]int64),
+					}
+				}
+			}
+		}
+		DPrintf("Config: gid=%v oldConfig=%v%v newConfig=%v%v\n",
+			kv.gid, kv.shardConfig.Num, kv.shardConfig.Shards, op.Config.Num, op.Config.Shards)
+		kv.shardConfig = op.Config
+		kv.transfering = kv.isTransfering();
+		return OpResult{}
+	case "Get":
+		db, found := getDb(op.GetReq.Shard)
+		if !found {
+			DPrintf("Get: gid=%v miss %v num=%v\n",
+				kv.gid, op.GetReq.Shard, kv.shardConfig.Num)
+			return OpResult{
+				getReply: GetReply{ Err: ErrWrongGroup },
+			}
+		}
+		value, ok := db.Kv[op.GetReq.Key]
 		if ok {
-			db[op.Key] = oldValue + op.Value
+			return OpResult{
+				getReply: GetReply{ Err: OK, Value: value },
+			}
+		}
+		return OpResult{
+			getReply: GetReply{ Err: ErrNoKey },
+		}
+	case "PutAppend":
+		db, found := getDb(op.PutAppendReq.Shard)
+		if !found {
+			DPrintf("PutAppend: gid=%v miss %v num=%v\n",
+				kv.gid, op.PutAppendReq.Shard, kv.shardConfig.Num)
+			return OpResult{
+				putAppendReply: PutAppendReply{ Err: ErrWrongGroup },
+			}
+		}
+		// Detect duplicate reqs.
+		oldSeq, ok := db.ClientSeq[op.PutAppendReq.ClientId]
+		if ok && op.PutAppendReq.Seq == oldSeq {
+			return OpResult{
+				putAppendReply: PutAppendReply{ Err: OK },
+			}
+		}
+		if op.PutAppendReq.Op == "Put" {
+			db.Kv[op.PutAppendReq.Key] = op.PutAppendReq.Value
 		} else {
-			db[op.Key] = op.Value
+			oldValue, ok := db.Kv[op.PutAppendReq.Key]
+			if ok {
+				db.Kv[op.PutAppendReq.Key] = oldValue + op.PutAppendReq.Value
+			} else {
+				db.Kv[op.PutAppendReq.Key] = op.PutAppendReq.Value
+			}
+		}
+		db.ClientSeq[op.PutAppendReq.ClientId] = op.PutAppendReq.Seq
+		return OpResult{
+			putAppendReply: PutAppendReply{ Err: OK },
+		}
+	case "Transfer":
+		req := op.TransferReq
+		if kv.shardConfig.Num != req.ConfigNum || kv.gid != req.DestGid {
+			return OpResult{
+				transferReply: TransferReply{ Err: ErrWrongGroup, ConfigNum: kv.shardConfig.Num },
+			}
+		}
+		if _, found := kv.shards[req.Shard]; found {
+			return OpResult{
+				transferReply: TransferReply{ Err: OK, ConfigNum: kv.shardConfig.Num },
+			}
+		}
+			
+		kv.shards[req.Shard] = cloneDb(req.Db)
+		kv.transfering = kv.isTransfering()
+		return OpResult{
+			transferReply: TransferReply{ Err: OK, ConfigNum: kv.shardConfig.Num },
+		}
+	case "DeleteShard":
+		req := op.DeleteShardReq
+		delete(kv.shards, req.Shard)
+		kv.transfering = kv.isTransfering()
+		return OpResult{
+			deleteShardReply: DeleteShardReply{ Err: OK },
 		}
 	default:
-		log.Fatalf("invalid op: %v\n", op.Op)
+		log.Fatalf("bad op: %v\n", op.Op)
 	}
-
-	kv.clientSeq[op.ClientId] = op.Seq
-	return OpResult{ err: OK }
+	return OpResult{}
 }
 
 func (kv *ShardKV) commit(op Op) (result OpResult, ok bool) {
@@ -283,40 +351,27 @@ func (kv *ShardKV) commit(op Op) (result OpResult, ok bool) {
 
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	opResultCh, ok2 := kv.opResultCh[index]
-	if ok2 {
+	opResultCh, ok := kv.opResultChs[index]
+	if ok {
 		opResultCh.refCnt++
-		kv.opResultCh[index] = opResultCh
+		kv.opResultChs[index] = opResultCh
 	} else {
-		kv.opResultCh[index] = OpResultCh{
+		opResultCh = OpResultCh{
+			opResultCh: make(chan OpResult, 1),
 			refCnt: 1,
-			opResultCh: make(chan OpResult),
 		}
+		kv.opResultChs[index] = opResultCh
 	}
 	for kv.currentTerm <= term {
 		if kv.lastIncludedIndex >= index {
-			opResultCh, _ = kv.opResultCh[index]
-			kv.mu.Unlock()
 			result = <- opResultCh.opResultCh
-			kv.mu.Lock()
-			opResultCh.refCnt--
-			kv.opResultCh[index] = opResultCh
-			if opResultCh.refCnt == 0 {
-				delete(kv.opResultCh, index)
-			}
 			ok = true
 			return
 		}
 		kv.cond.Wait()
 	}
-	opResultCh, _ = kv.opResultCh[index]	
-	opResultCh.refCnt--
-	kv.opResultCh[index] = opResultCh
-	if opResultCh.refCnt == 0 {
-		delete(kv.opResultCh, index)
-	}
 	ok = false
-	return 
+	return
 }
 
 func (kv *ShardKV) takeSnapshot() (snapshot []byte, lastIncludedIndex, lastIncludedTerm int) {
@@ -325,7 +380,7 @@ func (kv *ShardKV) takeSnapshot() (snapshot []byte, lastIncludedIndex, lastInclu
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.shards)
-	e.Encode(kv.clientSeq)
+	e.Encode(kv.shardConfig)
 
 	snapshot = w.Bytes()
 	lastIncludedIndex = kv.lastIncludedIndex
@@ -340,36 +395,128 @@ func (kv *ShardKV) readSnapshot(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var shards map[int]Db
-	var clientSeq map[int64]int64
+	var config shardmaster.Config
 	if d.Decode(&shards) != nil ||
-		d.Decode(&clientSeq) != nil {
+		d.Decode(&config) != nil {
 		panic(fmt.Sprintf("decode failed"))
 	} else {
 		kv.shards = shards
-		kv.clientSeq = clientSeq
+		kv.shardConfig = config
+		kv.transfering = kv.isTransfering()
 	}
 }
 
 func (kv *ShardKV) updateShardConfigRoutine() {
 	ticker := time.NewTicker(100*time.Millisecond)
-	lastConfigNum := 0
 	mck := shardmaster.MakeClerk(kv.masters)
 	for !kv.killed() {
-	loop:
 		select {
 		case <-ticker.C:
 			_, isLeader := kv.rf.GetState()
 			if !isLeader {
-				break loop
+				break
 			}
-			config := mck.Query(-1)
-			if config.Num > lastConfigNum {
-				lastConfigNum = config.Num
-				kv.commit(Op{
-					Op: "Config",
-					Config: config,
-				})
+			kv.mu.Lock()
+			if kv.transfering {
+				kv.mu.Unlock()
+				kv.transferShards()
+			} else {
+				idx := kv.shardConfig.Num
+				kv.mu.Unlock()
+				config := mck.Query(idx+1);
+				kv.mu.Lock()
+				if config.Num > kv.shardConfig.Num {
+					kv.mu.Unlock()
+					kv.commit(Op{
+						Op: "Config",
+						Config: config,
+					})
+				} else {
+					kv.mu.Unlock()
+				}
 			}
 		}
 	}
+}
+
+func (kv *ShardKV) transferShards() {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	
+	for shard := range kv.shards {
+		gid := kv.shardConfig.Shards[shard]
+		if gid == kv.gid {
+			continue
+		}
+		transferArgs := TransferArgs{
+			ConfigNum: kv.shardConfig.Num,
+			Db: cloneDb(kv.shards[shard]),
+			SourceGid: kv.gid,
+			DestGid: gid,
+			Shard: shard,
+		}
+		servers := kv.shardConfig.Groups[transferArgs.DestGid]
+		kv.mu.Unlock()
+		kv.sendTransfer(servers, &transferArgs)
+		kv.commit(Op{
+			Op: "DeleteShard",
+			DeleteShardReq: DeleteShardArgs{
+				Shard: shard,
+			},
+		})
+		kv.mu.Lock()
+	}
+}
+
+func (kv *ShardKV) sendTransfer(servers []string, args *TransferArgs) {
+	for {
+		for si := 0; si < len(servers); si++ {
+			srv := kv.make_end(servers[si])
+			reply := TransferReply{}
+			ok := srv.Call("ShardKV.Transfer", args, &reply)
+			if ok && (reply.Err == OK || reply.ConfigNum > args.ConfigNum) {
+				return
+			}
+			// ... not ok, or ErrWrongLeader
+		}
+	}
+}
+
+func cloneDb(db Db) Db {
+	copy := Db{
+		Kv: make(map[string]string),
+		ClientSeq: make(map[int64]int64),
+	}
+	for k, v := range db.Kv {
+		copy.Kv[k] = v
+	}
+	for k, v := range db.ClientSeq {
+		copy.ClientSeq[k] = v
+	}
+	return copy
+}
+
+func (kv *ShardKV) isTransfering() bool {
+	var outShards []int
+	var inShards []int
+	for shard := range kv.shards {
+		gid := kv.shardConfig.Shards[shard]
+		if gid != kv.gid {
+			outShards = append(outShards, shard)
+		}
+	}
+	for shard, gid := range kv.shardConfig.Shards {
+		if gid == kv.gid {
+			_, found := kv.shards[shard]
+			if !found {
+				inShards = append(inShards, shard)
+				return true
+			}
+		}
+	}
+	DPrintf("gid=%v num=%v outShards=%v inShards=%v\n", kv.gid, kv.shardConfig.Num, outShards, inShards)
+	if len(outShards) > 0 || len(inShards) > 0 {
+		return true
+	}
+	return false
 }

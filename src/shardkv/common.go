@@ -1,4 +1,5 @@
 package shardkv
+import "log"
 
 //
 // Sharded key/value server.
@@ -46,3 +47,34 @@ type GetReply struct {
 	Err   Err
 	Value string
 }
+
+type TransferArgs struct {
+	ConfigNum int
+	SourceGid int
+	DestGid int
+	Shard int
+	Db Db
+}
+
+type TransferReply struct {
+	Err Err
+	ConfigNum int
+}
+
+type DeleteShardArgs struct {
+	Shard int
+}
+
+type DeleteShardReply struct {
+	Err Err
+}
+
+const Debug = 0
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		log.Printf(format, a...)
+	}
+	return
+}
+
