@@ -208,7 +208,10 @@ func (kv *KVServer) apply() {
 }
 
 func (kv *KVServer) handleOp(op Op) OpResult {
-
+	if op.Op == "Noop" {
+		return OpResult{ err: OK }
+	}
+	
 	// Detect duplicate reqs.
 	oldSeq, ok := kv.clientSeq[op.ClientId]
 	if ok && op.Seq == oldSeq {
@@ -231,6 +234,8 @@ func (kv *KVServer) handleOp(op Op) OpResult {
 				Value: op.Value,
 			}
 		}
+	default:
+		panic(fmt.Sprintf("invalid op: %v\n", op.Op))
 	}
 	kv.clientSeq[op.ClientId] = op.Seq
 	return OpResult{ err: OK }

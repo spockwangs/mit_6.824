@@ -926,17 +926,19 @@ func max(a, b int) int {
 func (rf *Raft) apply() {
 	for {
 		var entries []LogEntry
-		func() {
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
-			for rf.lastApplied >= rf.commitIndex {
-				rf.stateChanged.Wait()
-			}
-			if rf.lastApplied + 1 >= rf.getStartIndex() {
-				entries = rf.getEntries(rf.lastApplied+1, rf.commitIndex+1)
-			}
-			rf.checkInv()
-		}()
+		rf.mu.Lock()
+		for !rf.killed() && rf.lastApplied >= rf.commitIndex {
+			rf.stateChanged.Wait()
+		}
+		if rf.killed() {
+			return
+		}
+		if rf.lastApplied + 1 >= rf.getStartIndex() {
+			entries = rf.getEntries(rf.lastApplied+1, rf.commitIndex+1)
+		}
+		rf.checkInv()
+		rf.mu.Unlock()
+
 		if len(entries) == 0 {
 			rf.mu.Lock()
 			msg := ApplyMsg{
