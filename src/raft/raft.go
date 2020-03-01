@@ -113,6 +113,7 @@ func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
 	rf.persister.SaveRaftState(rf.writePersist())
+	rf.checkInv()
 }
 
 func (rf *Raft) writePersist() []byte {
@@ -157,6 +158,7 @@ func (rf *Raft) readPersist(data []byte) {
 		if rf.lastIncludedIndex > rf.commitIndex {
 			rf.commitIndex = rf.lastIncludedIndex
 		}
+		rf.stateChanged.Broadcast()
 	}
 }
 
@@ -199,12 +201,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	rf.checkInv()
 	defer rf.mu.Unlock()
-	changed := false
+	shouldPersist := false
+	stateChanged := false
 	defer func() {
-		if changed {
+		if shouldPersist {
 			rf.persist()
+		}
+		if stateChanged {
 			rf.stateChanged.Broadcast()
-			rf.checkInv()
 		}
 	}()
 	
@@ -218,7 +222,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.status = FOLLOWER
 		rf.votedFor = -1
-		changed = true
+		shouldPersist = true
+		stateChanged = true
 	}
 	
 	if rf.votedFor >= 0 && rf.votedFor != args.CandidateId {
@@ -233,7 +238,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.status = FOLLOWER
 		rf.reschedule(false)
 		rf.votedFor = args.CandidateId
-		changed = true
+		shouldPersist = true
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
 		return
@@ -273,12 +278,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	rf.checkInv()
 	defer rf.mu.Unlock()
-	changed := false	// Is persistent state changed?
+	shouldPersist := false
+	stateChanged := false
 	defer func() {
-		if changed {
+		if shouldPersist {
 			rf.persist()
+		}
+		if stateChanged {
 			rf.stateChanged.Broadcast()
-			rf.checkInv()
 		}
 	}()
 	
@@ -293,7 +300,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.currentTerm < args.Term {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
-		changed = true
+		shouldPersist = true
+		stateChanged = true
 	}
 	reply.Term = rf.currentTerm
 	if rf.getLastIndex() < args.PrevLogIndex {
@@ -324,11 +332,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		if i > rf.getLastIndex() {
 			rf.logs = append(rf.logs, args.Entries[j:]...)
-			changed = true
+			shouldPersist = true
 			break
 		} else if rf.getEntry(i).Term != args.Entries[j].Term {
 			rf.logs = append(rf.getEntries(-1, i), args.Entries[j:]...)
-			changed = true
+			shouldPersist = true
 			break
 		}
 	}
@@ -340,7 +348,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				log.Fatalf("#logs=%v commitIndex=%v lastIndex=%v\n",
 					len(rf.logs), rf.commitIndex, rf.getLastIndex())
 			}
-			rf.stateChanged.Broadcast()
+			stateChanged = true
 		}
 	}
 	reply.Success = true
@@ -426,8 +434,15 @@ func (rf *Raft) InstallSnapshot(
 	rf.mu.Lock()
 	rf.checkInv()
 	defer rf.mu.Unlock()
+	shouldPersist := false
+	stateChanged := false
 	defer func() {
-		rf.checkInv()
+		if shouldPersist {
+			rf.persist()
+		}
+		if stateChanged {
+			rf.stateChanged.Broadcast()
+		}
 	}()
 	
 	reply.Term = rf.currentTerm
@@ -439,7 +454,8 @@ func (rf *Raft) InstallSnapshot(
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
-		rf.persist()
+		shouldPersist = true
+		stateChanged = true
 	}
 
 	// Skip stale snapshot.
@@ -494,12 +510,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	changed := false
-	defer func() {
-		if changed {
-			rf.persist()
-		}
-	}()
 	
 	if rf.status != LEADER {
 		isLeader = false
@@ -510,7 +520,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term: rf.currentTerm,
 			Command: command,
 		})
-	changed = true
+	rf.persist()
 	index = rf.getLastIndex()
 	term = rf.currentTerm
 
@@ -594,7 +604,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func (rf *Raft) tick() {
 	for !rf.killed() {
-		changed := false
 		rf.mu.Lock()
 		now := time.Now()
 		if rf.electionExpireTime.After(now) {
@@ -609,12 +618,8 @@ func (rf *Raft) tick() {
 			fallthrough
 		case CANDIDATE:
 			rf.startVotes()
-			changed = true
 		case LEADER:
 			rf.startCommit()
-		}
-		if changed {
-			rf.persist()
 		}
 		rf.mu.Unlock()
 	}
@@ -669,19 +674,13 @@ func (rf *Raft) startVotes() {
 
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			changed := false
-			defer func() {
-				if changed {
-					rf.persist()
-					rf.checkInv()
-				}
-			}()
 			
 			if voteResp.Term > rf.currentTerm {
 				rf.currentTerm = voteResp.Term
 				rf.votedFor = -1
 				rf.status = FOLLOWER
-				changed = true
+				rf.persist()
+				rf.stateChanged.Broadcast()
 				return
 			}
 			// Skip old resp.
@@ -713,6 +712,8 @@ func (rf *Raft) startVotes() {
 			}
 		} (i)
 	}
+	rf.persist()
+	rf.stateChanged.Broadcast()
 }
 
 // Start to send entries (or heartbeats if entries are empty)  to followers.
@@ -808,20 +809,13 @@ func (rf *Raft) handleAppendEntriesResp(
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	changed := false
-	defer func() {
-		if changed {
-			rf.persist()
-			rf.checkInv()
-		}
-	}()
-	
 	if appendEntriesResp.Term > rf.currentTerm {
 		rf.currentTerm = appendEntriesResp.Term
 		rf.status = FOLLOWER
 		rf.votedFor = -1
 		rf.reschedule(false)
-		changed = true
+		rf.persist()
+		rf.stateChanged.Broadcast()
 		return false
 	}
 	// Skip old resp.
@@ -860,13 +854,6 @@ func (rf *Raft) handleInstallSnapshotResp(
 	installSnapshotResp *InstallSnapshotReply) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	changed := false
-	defer func() {
-		if changed {
-			rf.persist()
-			rf.checkInv()
-		}
-	}()
 
 	if installSnapshotArgs.Term != rf.currentTerm {
 		return false
@@ -876,7 +863,8 @@ func (rf *Raft) handleInstallSnapshotResp(
 		rf.status = FOLLOWER
 		rf.votedFor = -1
 		rf.reschedule(false)
-		changed = true
+		rf.persist()
+		rf.stateChanged.Broadcast()
 		return false
 	}
 	rf.matchIndex[peer] = installSnapshotArgs.LastIncludedIndex
@@ -931,6 +919,7 @@ func (rf *Raft) apply() {
 			rf.stateChanged.Wait()
 		}
 		if rf.killed() {
+			rf.mu.Unlock()
 			return
 		}
 		if rf.lastApplied + 1 >= rf.getStartIndex() {

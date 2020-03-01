@@ -259,7 +259,7 @@ func (kv *KVServer) commit(op Op) OpResult {
 		kv.opResultChs[index] = opResultCh
 	} else {
 		opResultCh = OpResultCh{
-			opResultCh: make(chan OpResult),
+			opResultCh: make(chan OpResult, 1),
 			refCnt: 1,
 		}
 		kv.opResultChs[index] = opResultCh
