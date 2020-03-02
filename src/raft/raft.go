@@ -920,6 +920,7 @@ func (rf *Raft) apply() {
 		}
 		if rf.killed() {
 			rf.mu.Unlock()
+			close(rf.applyCh)
 			return
 		}
 		if rf.lastApplied + 1 >= rf.getStartIndex() {

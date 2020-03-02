@@ -235,8 +235,8 @@ func (sm *ShardMaster) takeSnapshot() (snapshot []byte, lastIncludedIndex, lastI
 	defer sm.mu.Unlock()
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	e.Encode(sm.clientSeq)
 	e.Encode(sm.configs)
+	e.Encode(sm.clientSeq)
 	snapshot = w.Bytes()
 	lastIncludedIndex = sm.lastIncludedIndex
 	lastIncludedTerm = sm.lastIncludedTerm
@@ -271,9 +271,9 @@ func (sm *ShardMaster) commit(op Op) bool {
 	for sm.currentTerm <= term {
 		if sm.lastIncludedIndex >= index {
 			if len(sm.configs) > 1 {
-			DPrintf("before config: %v\n, after config: %v\n",
-				sm.configs[len(sm.configs)-2].toString(),
-				sm.getLatestConfig().toString())
+				DPrintf("before config: %v\n, after config: %v\n",
+					sm.configs[len(sm.configs)-2].toString(),
+					sm.getLatestConfig().toString())
 			}
 			return true
 		}
