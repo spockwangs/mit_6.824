@@ -514,7 +514,6 @@ func (kv *ShardKV) isTransfering() bool {
 			_, found := kv.shards[shard]
 			if !found {
 				inShards = append(inShards, shard)
-				return true
 			}
 		}
 	}

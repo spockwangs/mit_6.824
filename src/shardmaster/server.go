@@ -237,6 +237,7 @@ func (sm *ShardMaster) takeSnapshot() (snapshot []byte, lastIncludedIndex, lastI
 	e := labgob.NewEncoder(w)
 	e.Encode(sm.configs)
 	e.Encode(sm.clientSeq)
+
 	snapshot = w.Bytes()
 	lastIncludedIndex = sm.lastIncludedIndex
 	lastIncludedTerm = sm.lastIncludedTerm
@@ -357,7 +358,13 @@ func (sm *ShardMaster) rebalance(config *Config) {
 		gidNumShards = append(gidNumShards, GidStat{gid: gid, numShards: num})
 	}
 	sort.Slice(gidNumShards, func(i, j int) bool {
-		return gidNumShards[i].numShards > gidNumShards[j].numShards
+		if gidNumShards[i].numShards > gidNumShards[j].numShards {
+			return true
+		} else if gidNumShards[i].numShards == gidNumShards[j].numShards &&
+			gidNumShards[i].gid < gidNumShards[j].gid {
+			return true
+		}
+		return false
 	})
 	DPrintf("gidNumShards %v\nconfig %v", gidNumShards, config.toString())
 	
