@@ -40,3 +40,4 @@ Assignments of MIT [6.824](https://pdos.csail.mit.edu/6.824/schedule.html).
    1. 任何时候只有一个group处理这个shard，在处理请求时要求客户端与服务端的config保持一致可解决这个问题。
    2. 任何时候shard的owner只有一个。依次按顺序变更config，当shard转移完成（包括把不需要的shard转移出
       去和等待别的group转移shard给我）之后才变更到下一个config。
+4. 执行提交的operation时要保证算法是确定性的，否则会出现各节点的状态不一致。比如`slice.Sort()`就不一定是确定性的。
