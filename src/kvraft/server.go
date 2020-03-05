@@ -157,7 +157,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 }
 
 func (kv *KVServer) apply() {
-	ticker := time.NewTicker(5*time.Millisecond)
+	ticker := time.NewTicker(100*time.Millisecond)
+	lastSnapshotIndex := 0
 	for {
 		select {
 		case m, ok := <- kv.applyCh:
@@ -186,6 +187,7 @@ func (kv *KVServer) apply() {
 			}
 			kv.cond.Broadcast()
 			kv.mu.Unlock()
+
 			// 在Op处理完之后才通知client，防止死锁。
 			if opResultCh != nil {
 				opResultCh <- opResult
@@ -198,10 +200,13 @@ func (kv *KVServer) apply() {
 				kv.cond.Broadcast()
 			}
 			kv.mu.Unlock()
-			
-			if kv.maxraftstate > 0 && kv.rf.GetStateSize() >= kv.maxraftstate {
-				snapshot, lastIncludedIndex, lastIncludedTerm := kv.takeSnapshot()
-				kv.rf.SaveStateAndSnapshot(snapshot, lastIncludedIndex, lastIncludedTerm)
+
+			if kv.maxraftstate > 0 && kv.rf.GetStateSize() >= int(float64(kv.maxraftstate) * 0.7) {
+				snapshot, lastIncludedIndex, lastIncludedTerm := kv.takeSnapshot(lastSnapshotIndex)
+				if snapshot != nil {
+					kv.rf.SaveStateAndSnapshot(snapshot, lastIncludedIndex, lastIncludedTerm)
+					lastSnapshotIndex = lastIncludedIndex
+				}
 			}
 		}
 	}
@@ -288,9 +293,13 @@ func (kv *KVServer) commit(op Op) OpResult {
 	return OpResult{ err: ErrWrongLeader }
 }
 
-func (kv *KVServer) takeSnapshot() (snapshot []byte, lastIncludedIndex, lastIncludedTerm int) {
+func (kv *KVServer) takeSnapshot(lastSnapshotIndex int) (snapshot []byte, lastIncludedIndex, lastIncludedTerm int) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+	if kv.lastIncludedIndex <= lastSnapshotIndex {
+		return nil, 0, 0
+	}
+
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.db)
