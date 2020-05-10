@@ -10,8 +10,8 @@ Assignments of MIT [6.824](https://pdos.csail.mit.edu/6.824/schedule.html).
    否过期的，即自从发请求以来状态是否有变化（比如term、nextIndex是否发生变化），如果有则忽略这个响应。
 3. 每个RPC请求应该是异步的，防止某个RPC过慢阻塞其它的RPC.
 4. 实现linearizable读有两种方法：
-   1. 先提交no-op操作，完成后再读，保证leader有完整的提交日志；
-   2. 刚当选leader时先提交no-op操作，完成后再对外支持读操作，并保证leader在一段时间不能变（比如10s），
+   1. 任何节点可支持读操作。收到读请求后先提交no-op操作，完成后再读，保证leader有完整的提交日志；
+   2. 只有leader节点支持读。刚当选leader时先提交no-op操作，完成后再对外支持读操作，并保证leader在一段时间不能变（比如10s），
       在这段时间内可以直接支持读操作，不用每次都要提交no-op操作。但是集群要保证各自节点的时钟是高度
       同步的。
 
