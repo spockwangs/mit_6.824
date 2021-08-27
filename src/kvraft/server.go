@@ -10,6 +10,7 @@ import (
 	"time"
 	"bytes"
 	"fmt"
+	"container/list"
 )
 
 const Debug = 0
@@ -60,9 +61,14 @@ type KVServer struct {
 	clientSeq map[int64]int64 // client id => last op seq
 	lastIncludedIndex int
 	lastIncludedTerm int
-	cond *sync.Cond		// predicate: currentTerm changed or lastIncludedIndex changed
-	currentTerm int
-	opResultChs map[int]*OpResultCh
+	cond *sync.Cond		// predicate: lastIncludedIndex changed
+	proposals *list.List
+}
+
+type Proposal struct {
+	term int
+	index int
+	ch chan OpResult
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -89,7 +95,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	opResult := kv.commit(Op{
+	opResult := kv.replicate(Op{
 		Op: args.Op,
 		Key: args.Key,
 		Value: args.Value,
@@ -150,7 +156,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.cond = sync.NewCond(&kv.mu)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.opResultChs = make(map[int]*OpResultCh)
+	kv.proposals = list.New()
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
@@ -169,6 +175,8 @@ func (kv *KVServer) apply() {
 				return
 			}
 
+			var opResult OpResult
+			handled := false
 			kv.mu.Lock()
 			if !m.CommandValid {
 				DPrintf("received snapshot: index=%v\n", m.CommandIndex)
@@ -176,28 +184,33 @@ func (kv *KVServer) apply() {
 			} else if m.Command != nil {
 				op := m.Command.(Op)
 				DPrintf("received op: index=%v %v\n", m.CommandIndex, op)
-				opResult := kv.handleOp(op)
-				if ch, ok := kv.opResultChs[m.CommandIndex]; ok {
-					ch.term = m.Term
-					ch.opResult = opResult
-				}
+				opResult = kv.handleOp(op)
+				handled = true
 			}
 			kv.lastIncludedIndex = m.CommandIndex
 			kv.lastIncludedTerm = m.Term
-			if kv.lastIncludedTerm > kv.currentTerm {
-				kv.currentTerm = kv.lastIncludedTerm
-			}
+			kv.mu.Unlock()
 			kv.cond.Broadcast()
-			kv.mu.Unlock()
-		case <-ticker.C:
-			term, _ := kv.rf.GetState()
-			kv.mu.Lock()
-			if term > kv.currentTerm {
-				kv.currentTerm = term
-				kv.cond.Broadcast()
+			if handled {
+				for kv.proposals.Len() > 0 {
+					e := kv.proposals.Front()
+					kv.proposals.Remove(e)
+					proposal := e.Value.(Proposal)
+					if proposal.term == m.Term {
+						if proposal.index == m.CommandIndex {
+							proposal.ch <- opResult
+						} else {
+							panic(fmt.Sprintf("mismatched index: %v vs. %v", proposal.index, m.CommandIndex))
+						}
+						break
+					} else {
+						proposal.ch <- OpResult{
+							err: ErrWrongLeader,
+						}
+					}
+				}
 			}
-			kv.mu.Unlock()
-
+		case <-ticker.C:
 			if kv.maxraftstate > 0 && kv.rf.GetStateSize() >= int(float64(kv.maxraftstate) * 0.7) {
 				snapshot, lastIncludedIndex, lastIncludedTerm := kv.takeSnapshot(lastSnapshotIndex)
 				if snapshot != nil {
@@ -251,47 +264,25 @@ func (kv *KVServer) waitFor(index int) {
 	kv.mu.Unlock()
 }
 	
-func (kv *KVServer) commit(op Op) OpResult {
+// Propose an operation until it is applied or rejected.
+func (kv *KVServer) replicate(op Op) OpResult {
+	kv.mu.Lock()
 	index, term, isLeader := kv.rf.Start(op)
 	if !isLeader {
+		kv.mu.Unlock()
 		return OpResult{ err: ErrWrongLeader }
 	}
 
-	DPrintf("commit op: index=%v, %v\n", index, op)
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	// 虽然多个提交可能会使用同一个index（第一次提交时还是leader，然后立即失去leader角色，然后又
-	// 重新获得leader，又一个client提交，这2次返回的index可能相同），但是最多只有一个client的提
-	// 交会成功，所以只有一个client会从opResultCh收到通知。
-	opResultCh, ok := kv.opResultChs[index]
-	if ok {
-		opResultCh.refCnt++
-	} else {
-		opResultCh = &OpResultCh{
-			refCnt: 1,
-		}
-		kv.opResultChs[index] = opResultCh
-	}
-	defer func() {
-		ch, ok := kv.opResultChs[index]
-		if !ok {
-			panic(fmt.Sprintf("index %v of kv.opResultChs does not exist\n", index))
-		}
-		if ch.refCnt == 1 {
-			delete(kv.opResultChs, index)
-		} else {
-			ch.refCnt--
-		}
-	}()
-	for kv.lastIncludedIndex < index {
-		kv.cond.Wait()
-	}
-	if opResultCh.term == term {
-		DPrintf("commit op: index=%v, %v, true\n", index, op)
-		return opResultCh.opResult
-	}
-	DPrintf("commit op: index=%v, %v, false\n", index, op)
-	return OpResult{ err: ErrWrongLeader }
+	DPrintf("replicate op: index=%v, %v\n", index, op)
+	ch := make(chan OpResult)
+	kv.proposals.PushBack(Proposal{
+		term: term,
+		index: index,
+		ch: ch,
+	})
+	kv.mu.Unlock()
+	opResult := <- ch
+	return opResult
 }
 
 func (kv *KVServer) takeSnapshot(lastSnapshotIndex int) (snapshot []byte, lastIncludedIndex, lastIncludedTerm int) {
