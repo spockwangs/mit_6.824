@@ -38,7 +38,8 @@ type OpResult struct {
 }
 
 type OpResultCh struct {
-	opResultCh chan OpResult
+	opResult OpResult
+	term int
 	refCnt int
 }
 
@@ -61,16 +62,18 @@ type KVServer struct {
 	lastIncludedTerm int
 	cond *sync.Cond		// predicate: currentTerm changed or lastIncludedIndex changed
 	currentTerm int
-	opResultChs map[int]OpResultCh
+	opResultChs map[int]*OpResultCh
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
-	opResult := kv.commit(Op{ Op: "Noop" })
-	if opResult.err != OK {
-		reply.Err = opResult.err
+	index, is_leader := kv.rf.GetLastCommitIndex()
+	if !is_leader {
+		reply.Value = ""
+		reply.Err = ErrWrongLeader
+		DPrintf("Get: reply=%v\n", reply)
 		return
 	}
+	kv.waitFor(index)
 
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
@@ -147,7 +150,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.cond = sync.NewCond(&kv.mu)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.opResultChs = make(map[int]OpResultCh)
+	kv.opResultChs = make(map[int]*OpResultCh)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
@@ -166,18 +169,17 @@ func (kv *KVServer) apply() {
 				return
 			}
 
-			var opResult OpResult
-			var opResultCh chan OpResult
 			kv.mu.Lock()
 			if !m.CommandValid {
 				DPrintf("received snapshot: index=%v\n", m.CommandIndex)
 				kv.readSnapshot(m.Snapshot)
-			} else {
+			} else if m.Command != nil {
 				op := m.Command.(Op)
 				DPrintf("received op: index=%v %v\n", m.CommandIndex, op)
-				opResult = kv.handleOp(op)
+				opResult := kv.handleOp(op)
 				if ch, ok := kv.opResultChs[m.CommandIndex]; ok {
-					opResultCh = ch.opResultCh
+					ch.term = m.Term
+					ch.opResult = opResult
 				}
 			}
 			kv.lastIncludedIndex = m.CommandIndex
@@ -187,11 +189,6 @@ func (kv *KVServer) apply() {
 			}
 			kv.cond.Broadcast()
 			kv.mu.Unlock()
-
-			// 在Op处理完之后才通知client，防止死锁。
-			if opResultCh != nil {
-				opResultCh <- opResult
-			}
 		case <-ticker.C:
 			term, _ := kv.rf.GetState()
 			kv.mu.Lock()
@@ -246,6 +243,14 @@ func (kv *KVServer) handleOp(op Op) OpResult {
 	return OpResult{ err: OK }
 }
 
+func (kv *KVServer) waitFor(index int) {
+	kv.mu.Lock()
+	for kv.lastIncludedIndex < index {
+		kv.cond.Wait()
+	}
+	kv.mu.Unlock()
+}
+	
 func (kv *KVServer) commit(op Op) OpResult {
 	index, term, isLeader := kv.rf.Start(op)
 	if !isLeader {
@@ -261,10 +266,8 @@ func (kv *KVServer) commit(op Op) OpResult {
 	opResultCh, ok := kv.opResultChs[index]
 	if ok {
 		opResultCh.refCnt++
-		kv.opResultChs[index] = opResultCh
 	} else {
-		opResultCh = OpResultCh{
-			opResultCh: make(chan OpResult, 1),
+		opResultCh = &OpResultCh{
 			refCnt: 1,
 		}
 		kv.opResultChs[index] = opResultCh
@@ -278,16 +281,14 @@ func (kv *KVServer) commit(op Op) OpResult {
 			delete(kv.opResultChs, index)
 		} else {
 			ch.refCnt--
-			kv.opResultChs[index] = ch
 		}
 	}()
-	for kv.currentTerm <= term {
-		if kv.lastIncludedIndex >= index {
-			DPrintf("commit op: index=%v, %v, true\n", index, op)
-			opResult := <- opResultCh.opResultCh
-			return opResult
-		}
+	for kv.lastIncludedIndex < index {
 		kv.cond.Wait()
+	}
+	if opResultCh.term == term {
+		DPrintf("commit op: index=%v, %v, true\n", index, op)
+		return opResultCh.opResult
 	}
 	DPrintf("commit op: index=%v, %v, false\n", index, op)
 	return OpResult{ err: ErrWrongLeader }

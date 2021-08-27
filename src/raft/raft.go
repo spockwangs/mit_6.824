@@ -705,6 +705,14 @@ func (rf *Raft) startVotes() {
 						rf.nextIndex[i] = rf.getLastIndex() + 1
 						rf.matchIndex[i] = rf.lastIncludedIndex
 					}
+
+					// Append no-op entries.
+					rf.logs = append(rf.logs, LogEntry {
+						Term: rf.currentTerm,
+							Command: nil,
+						})
+					rf.persist()
+
 					// start heartbeat right now to prevent some
 					// follower from becoming a candidate.
 					rf.reschedule(true)
@@ -1057,4 +1065,24 @@ func (rf *Raft) check(exp bool) {
 	if !exp {
 		panic(fmt.Sprintf("%v\n", rf.toString()))
 	}
+}
+
+func (rf *Raft) GetLastCommitIndex() (commitIndex int, isLeader bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.status != LEADER {
+		return 0, false
+	}
+	// We are the leader, but we should check if we have up-to-date commit index. The only time when
+	// we don't have an up-to-date commit index is that we becomes the new leader with an new term just now.
+	var commitTerm int
+	if rf.commitIndex == rf.lastIncludedIndex {
+		commitTerm = rf.lastIncludedTerm
+	} else {
+		commitTerm = rf.getEntry(rf.commitIndex).Term
+	}
+	if commitTerm == rf.currentTerm {
+		return rf.commitIndex, true
+	}
+	return 0, false
 }
