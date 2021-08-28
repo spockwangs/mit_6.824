@@ -174,7 +174,6 @@ func (kv *KVServer) apply() {
 
 			kv.mu.Lock()
 			if !m.CommandValid {
-				DPrintf("received snapshot: index=%v\n", m.CommandIndex)
 				kv.readSnapshot(m.Snapshot)
 			} else {
 				proposal := kv.findProposal(m.Term, m.CommandIndex)
@@ -192,6 +191,7 @@ func (kv *KVServer) apply() {
 			kv.mu.Unlock()
 			kv.cond.Broadcast()
 
+			// Log compaction.
 			if kv.maxraftstate > 0 && kv.rf.GetStateSize() >= int(float64(kv.maxraftstate)*0.7) {
 				snapshot, lastIncludedIndex, lastIncludedTerm := kv.takeSnapshot(lastSnapshotIndex)
 				if snapshot != nil {
@@ -256,6 +256,13 @@ func (kv *KVServer) replicate(op Op) OpResult {
 
 	DPrintf("replicate op: index=%v, %v\n", index, op)
 	ch := make(chan OpResult, 1)
+	if b := kv.proposals.Back(); b != nil {
+		p := b.Value.(Proposal)
+		if (p.term < term || (p.term == term && p.index < index)) {
+		} else {
+			panic(fmt.Sprintf("bad proposal order: (%v, %v) (%v, %v)", p.term, p.index, term, index))
+		}
+	}
 	kv.proposals.PushBack(Proposal{
 		term:  term,
 		index: index,
@@ -317,8 +324,13 @@ func (kv *KVServer) findProposal(term, index int) *Proposal {
 			if p.index == index {
 				return &p
 			} else {
-				//  index > p.index
-				panic(fmt.Sprintf("mismatched index: %v vs %v", p.index, index))
+				// index > p.index
+				// 提交了数据，但是由于网络原因而变成从节点，收到了主节点的snapshot，
+				// 所以这里的index有跳变。由于同一个term较大index的数据都能成功提交，
+				// 所以该proposal肯定也成功提交了。
+				p.ch <- OpResult{
+					err: OK,
+				}
 			}
 		} else {
 			kv.proposals.Remove(e)
@@ -329,4 +341,13 @@ func (kv *KVServer) findProposal(term, index int) *Proposal {
 		}
 	}
 	return nil
+}
+
+func (kv *KVServer) proposalsToString() string {
+	var result string
+	for e := kv.proposals.Front(); e != nil; e = e.Next() {
+		p := e.Value.(Proposal)
+		result += fmt.Sprintf("(%v %v)", p.term, p.index)
+	}
+	return result
 }
