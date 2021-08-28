@@ -3,14 +3,13 @@ package kvraft
 import (
 	"../labgob"
 	"../labrpc"
-	"log"
 	"../raft"
+	"bytes"
+	"container/list"
+	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
-	"time"
-	"bytes"
-	"fmt"
-	"container/list"
 )
 
 const Debug = 0
@@ -22,16 +21,15 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Op string		// "Put" or "Append" or "Noop"
-	Key string
-	Value string
+	Op       string // "Put" or "Append" or "Noop"
+	Key      string
+	Value    string
 	ClientId int64
-	Seq int64
+	Seq      int64
 }
 
 type OpResult struct {
@@ -40,8 +38,8 @@ type OpResult struct {
 
 type OpResultCh struct {
 	opResult OpResult
-	term int
-	refCnt int
+	term     int
+	refCnt   int
 }
 
 type DbValue struct {
@@ -57,29 +55,29 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	db map[string]DbValue
-	clientSeq map[int64]int64 // client id => last op seq
+	db                map[string]DbValue
+	clientSeq         map[int64]int64 // client id => last op seq
 	lastIncludedIndex int
-	lastIncludedTerm int
-	cond *sync.Cond		// predicate: lastIncludedIndex changed
-	proposals *list.List
+	lastIncludedTerm  int
+	cond              *sync.Cond // predicate: lastIncludedIndex changed
+	proposals         *list.List
 }
 
 type Proposal struct {
-	term int
+	term  int
 	index int
-	ch chan OpResult
+	ch    chan OpResult
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	index, is_leader := kv.rf.GetLastCommitIndex()
-	if !is_leader {
+	opResult := kv.replicate(Op{
+		Op: "Noop",
+	})
+	if opResult.err != OK {
 		reply.Value = ""
-		reply.Err = ErrWrongLeader
-		DPrintf("Get: reply=%v\n", reply)
+		reply.Err = opResult.err
 		return
 	}
-	kv.waitFor(index)
 
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
@@ -96,10 +94,10 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	opResult := kv.replicate(Op{
-		Op: args.Op,
-		Key: args.Key,
-		Value: args.Value,
-		Seq: args.Seq,
+		Op:       args.Op,
+		Key:      args.Key,
+		Value:    args.Value,
+		Seq:      args.Seq,
 		ClientId: args.ClientId,
 	})
 	reply.Err = opResult.err
@@ -161,57 +159,40 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	go kv.apply()
-	
+
 	return kv
 }
 
 func (kv *KVServer) apply() {
-	ticker := time.NewTicker(100*time.Millisecond)
 	lastSnapshotIndex := 0
 	for {
 		select {
-		case m, ok := <- kv.applyCh:
+		case m, ok := <-kv.applyCh:
 			if !ok {
 				return
 			}
 
-			var opResult OpResult
-			handled := false
 			kv.mu.Lock()
 			if !m.CommandValid {
 				DPrintf("received snapshot: index=%v\n", m.CommandIndex)
 				kv.readSnapshot(m.Snapshot)
-			} else if m.Command != nil {
-				op := m.Command.(Op)
-				DPrintf("received op: index=%v %v\n", m.CommandIndex, op)
-				opResult = kv.handleOp(op)
-				handled = true
+			} else {
+				proposal := kv.findProposal(m.Term, m.CommandIndex)
+				if m.Command != nil {
+					op := m.Command.(Op)
+					DPrintf("received op: index=%v %v\n", m.CommandIndex, op)
+					opResult := kv.handleOp(op)
+					if proposal != nil {
+						proposal.ch <- opResult
+					}
+				}
 			}
 			kv.lastIncludedIndex = m.CommandIndex
 			kv.lastIncludedTerm = m.Term
 			kv.mu.Unlock()
 			kv.cond.Broadcast()
-			if handled {
-				for kv.proposals.Len() > 0 {
-					e := kv.proposals.Front()
-					kv.proposals.Remove(e)
-					proposal := e.Value.(Proposal)
-					if proposal.term == m.Term {
-						if proposal.index == m.CommandIndex {
-							proposal.ch <- opResult
-						} else {
-							panic(fmt.Sprintf("mismatched index: %v vs. %v", proposal.index, m.CommandIndex))
-						}
-						break
-					} else {
-						proposal.ch <- OpResult{
-							err: ErrWrongLeader,
-						}
-					}
-				}
-			}
-		case <-ticker.C:
-			if kv.maxraftstate > 0 && kv.rf.GetStateSize() >= int(float64(kv.maxraftstate) * 0.7) {
+
+			if kv.maxraftstate > 0 && kv.rf.GetStateSize() >= int(float64(kv.maxraftstate)*0.7) {
 				snapshot, lastIncludedIndex, lastIncludedTerm := kv.takeSnapshot(lastSnapshotIndex)
 				if snapshot != nil {
 					kv.rf.SaveStateAndSnapshot(snapshot, lastIncludedIndex, lastIncludedTerm)
@@ -224,15 +205,15 @@ func (kv *KVServer) apply() {
 
 func (kv *KVServer) handleOp(op Op) OpResult {
 	if op.Op == "Noop" {
-		return OpResult{ err: OK }
+		return OpResult{err: OK}
 	}
-	
+
 	// Detect duplicate reqs.
 	oldSeq, ok := kv.clientSeq[op.ClientId]
 	if ok && op.Seq == oldSeq {
-		return OpResult{ err: OK }
+		return OpResult{err: OK}
 	}
-	
+
 	switch op.Op {
 	case "Put":
 		kv.db[op.Key] = DbValue{
@@ -253,7 +234,7 @@ func (kv *KVServer) handleOp(op Op) OpResult {
 		panic(fmt.Sprintf("invalid op: %v\n", op.Op))
 	}
 	kv.clientSeq[op.ClientId] = op.Seq
-	return OpResult{ err: OK }
+	return OpResult{err: OK}
 }
 
 func (kv *KVServer) waitFor(index int) {
@@ -263,25 +244,25 @@ func (kv *KVServer) waitFor(index int) {
 	}
 	kv.mu.Unlock()
 }
-	
+
 // Propose an operation until it is applied or rejected.
 func (kv *KVServer) replicate(op Op) OpResult {
 	kv.mu.Lock()
 	index, term, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		kv.mu.Unlock()
-		return OpResult{ err: ErrWrongLeader }
+		return OpResult{err: ErrWrongLeader}
 	}
 
 	DPrintf("replicate op: index=%v, %v\n", index, op)
-	ch := make(chan OpResult)
+	ch := make(chan OpResult, 1)
 	kv.proposals.PushBack(Proposal{
-		term: term,
+		term:  term,
 		index: index,
-		ch: ch,
+		ch:    ch,
 	})
 	kv.mu.Unlock()
-	opResult := <- ch
+	opResult := <-ch
 	return opResult
 }
 
@@ -318,4 +299,34 @@ func (kv *KVServer) readSnapshot(data []byte) {
 		kv.db = db
 		kv.clientSeq = clientSeq
 	}
+}
+
+// Find the proposal with matched term and index.
+func (kv *KVServer) findProposal(term, index int) *Proposal {
+	for kv.proposals.Len() > 0 {
+		e := kv.proposals.Front()
+		p := e.Value.(Proposal)
+		// All entries are in increasing order of (term, index), i.e. term is increasing
+		// and index in the same term is increasing. Index of different terms is not
+		// always increasing.
+		if term < p.term || (term == p.term && index < p.index) {
+			break
+		} else if p.term == term {
+			// index >= p.index
+			kv.proposals.Remove(e)
+			if p.index == index {
+				return &p
+			} else {
+				//  index > p.index
+				panic(fmt.Sprintf("mismatched index: %v vs %v", p.index, index))
+			}
+		} else {
+			kv.proposals.Remove(e)
+			// Notify stale proposals.
+			p.ch <- OpResult{
+				err: ErrWrongLeader,
+			}
+		}
+	}
+	return nil
 }

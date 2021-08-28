@@ -952,11 +952,6 @@ func (rf *Raft) apply() {
 			for _, entry := range entries {
 				rf.mu.Lock()
 				rf.lastApplied++
-				// Skip no-op entry.
-				if entry.Command == nil {
-					rf.mu.Unlock()
-					continue
-				}
 				lastApplied := rf.lastApplied
 				rf.mu.Unlock()
 				rf.applyCh <- ApplyMsg {
