@@ -13,7 +13,7 @@ Assignments of MIT [6.824](https://pdos.csail.mit.edu/6.824/schedule.html).
    1. No-op read: 与写操作类似，leader收到读请求后先提交no-op操作，获得commit index（保证是最新的，一定比之前的写的
       index大），等待apply完成后再读；
    2. ReadIndex: 实现linearizable读的关键在于获得最新的commit index，然后等到该操作apply完成即可读。
-      为了获得最新的commit index，可以不用提交no-op操作，而是使用心跳，确认leader的地位后即可确定
+      为了获得最新的commit index，leader可以不用提交no-op操作，而是使用心跳，确认自己仍然是leader后即可确定
       leader有最新的commit index. 这比提交no-op操作性能要高，因为不需要同步写磁盘。但是在刚成为
       leader时必须提交一个no-op操作，保证leader的commit index是最新的。
    3. Lease read: 不用走提交协议，leader可直接读。刚当选leader时先提交no-op操作（因为刚刚当选的
